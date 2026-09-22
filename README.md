@@ -58,7 +58,7 @@ saveMode = "cl" -- cl 或 file
 loadstring(game:HttpGet("https://raw.githubusercontent.com/Luaunveil/luau-decompiler/refs/heads/main/decompiler.luau"))()
 ```
 
-`input` 是游戏中的**脚本实例路径**：支持 `Workspace.LocalScript`、`game.Workspace.LocalScript`、`Workspace["带空格的脚本名"]`，也可直接传入脚本 Instance。只解析路径，不执行路径文本或目标脚本。
+`input` 是游戏中的**脚本实例路径**：支持 `Workspace.LocalScript`、`game.Workspace.LocalScript`、`game:GetService("Players").LocalPlayer.PlayerScripts["294Client"]`、`Workspace["带空格的脚本名"]`，也可直接传入脚本 Instance。`GetService` 仅接受字符串字面量；`LocalPlayer` 等实例属性正常解析，不执行路径文本或目标脚本。
 
 文件直接保存到执行器工作区根目录，命名为 **`{ScriptName}{yyyymmddss}{Number}.lua`**。日期使用宿主本地时间，`ss` 是两位秒数；`Number` 从 1 递增并跳过已有文件，不覆盖旧输出。脚本名中无法用于文件名的字符替换为 `_`。
 

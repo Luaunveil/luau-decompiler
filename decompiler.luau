@@ -1569,47 +1569,74 @@ local function pathParts(path)
         space()
         local first, last = path:find("[A-Za-z_][A-Za-z0-9_]*", pos)
         check(first == pos, "expected instance name at path position " .. pos)
-        parts[#parts + 1] = path:sub(first, last); pos = last + 1
+        local value = path:sub(first, last); pos = last + 1
+        return value
     end
-    name()
+    local function quoted()
+        space(); local delimiter = path:sub(pos, pos); pos = pos + 1
+        check(delimiter == '"' or delimiter == "'", "path keys and service names require a quoted string literal")
+        local chars, closed = {}, false
+        while pos <= size do
+            local c = path:sub(pos, pos); pos = pos + 1
+            if c == delimiter then closed = true; break end
+            if c == "\\" then
+                c = path:sub(pos, pos); pos = pos + 1
+                check(c == "\\" or c == '"' or c == "'", "unsupported escape in instance path")
+            end
+            chars[#chars + 1] = c
+        end
+        check(closed, "unterminated quoted path string")
+        return concat(chars)
+    end
+    local rootName = name()
+    parts[1] = { kind = "member", name = rootName }
     while true do
         space(); if pos > size then break end
         local symbol = path:sub(pos, pos); pos = pos + 1
-        if symbol == "." then name()
+        if symbol == "." then
+            parts[#parts + 1] = { kind = "member", name = name() }
         elseif symbol == "[" then
-            space(); local delimiter = path:sub(pos, pos); pos = pos + 1
-            check(delimiter == '"' or delimiter == "'", "bracket paths require a quoted child name")
-            local chars, closed = {}, false
-            while pos <= size do
-                local c = path:sub(pos, pos); pos = pos + 1
-                if c == delimiter then closed = true; break end
-                if c == "\\" then
-                    c = path:sub(pos, pos); pos = pos + 1
-                    check(c == "\\" or c == '"' or c == "'", "unsupported escape in instance path")
-                end
-                chars[#chars + 1] = c
-            end
-            check(closed, "unterminated quoted child name")
+            local key = quoted()
             space(); check(path:sub(pos, pos) == "]", "expected closing path bracket"); pos = pos + 1
-            parts[#parts + 1] = concat(chars)
-        else fail("instance paths accept only names, dots and quoted brackets; not executable expressions") end
+            parts[#parts + 1] = { kind = "member", name = key }
+        elseif symbol == ":" then
+            local method = name()
+            check(method == "GetService" and #parts == 1 and (rootName == "game" or rootName == "Game"), "only game:GetService(quoted service name) is supported in instance paths")
+            space(); check(path:sub(pos, pos) == "(", "expected '(' after GetService"); pos = pos + 1
+            local service = quoted()
+            space(); check(path:sub(pos, pos) == ")", "GetService requires exactly one quoted service name"); pos = pos + 1
+            parts[#parts + 1] = { kind = "service", name = service }
+        else fail("instance paths accept names, dots, quoted brackets and game:GetService(quoted service name); not arbitrary expressions") end
     end
     return parts
 end
 function D.resolve(target)
     if isInstance(target) then return target end
+    -- Validate the entire path before performing any host lookup. Do not use
+    -- loadstring: only the explicitly parsed GetService operation is callable.
     local parts = pathParts(target)
     check(isInstance(game), "host does not provide Roblox game")
     local current, first = game, 1
-    if parts[1] == "game" or parts[1] == "Game" then first = 2 end
+    if parts[1].name == "game" or parts[1].name == "Game" then first = 2 end
     for j = first, #parts do
-        local name = parts[j]
-        if current == game and (name == "workspace" or name == "Workspace") then
+        local part = parts[j]
+        local name = part.name
+        if part.kind == "service" then
+            current = hostCall(game.GetService, "GetService", game, name)
+            check(isInstance(current), "GetService did not return an Instance: " .. quote(name))
+        elseif current == game and (name == "workspace" or name == "Workspace") then
             current = hostCall(game.GetService, "GetService", game, "Workspace")
+            check(isInstance(current), "Workspace service is not available")
         else
-            current = hostCall(current.FindFirstChild, "FindFirstChild", current, name)
+            -- Roblox member lookup resolves both properties (LocalPlayer,
+            -- Character, Parent) and children. FindFirstChild alone cannot do
+            -- this and can silently select a child that shadows a property.
+            local ok, member = pcall(function() return current[name] end)
+            check(ok, "cannot read instance member " .. quote(name) .. ": " .. tostring(member))
+            check(member ~= nil, "instance member " .. quote(name) .. " is nil (not available yet)")
+            check(isInstance(member), "instance member " .. quote(name) .. " is not an Instance")
+            current = member
         end
-        check(isInstance(current), "instance path component not found: " .. quote(name))
     end
     return current
 end

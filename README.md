@@ -101,7 +101,7 @@ local source, info = decompiler.decompile(bytes, {
 })
 ```
 
-**默认不设资源上限。** 不再因字符串长度、输入／输出大小、分析工作量或嵌套深度触发内置配额。仅在调用方主动提供 `max_*` 数值时启用对应限制；`false` 关闭该项。字节码格式检查仍保留。
+**默认不设资源上限。** 不再因字符串长度、输入／输出大小、分析工作量或嵌套深度触发内置配额。仅在调用主动提供 `max_*` 数值时启用对应限制；`false` 关闭该项。字节码格式检查仍保留。
 
 `opcode_multiplier` 可指定奇数解码乘数；`upvalue_names` 提供根函数的实际外部上值名；`vector_constructor` / `integer_constructor` 指定宿主构造器，仅接受合格标识符路径。完整配置见 [`decompiler.lua`](decompiler.lua)。
 

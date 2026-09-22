@@ -60,8 +60,6 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/Luaunveil/luau-decomp
 
 `input` 是游戏中的**脚本实例路径**：支持 `Workspace.LocalScript`、`game.Workspace.LocalScript`、`Workspace["带空格的脚本名"]`，也可直接传入脚本 Instance。只解析路径，不执行路径文本或目标脚本。
 
-宿主需提供 `getscriptbytecode`；反编译仍由本模块完成，不调用宿主的 `decompile`。`cl` 需要 `setclipboard`，`file` 需要 `writefile`、`readfile`、`isfile`。
-
 文件直接保存到执行器工作区根目录，命名为 **`{ScriptName}{yyyymmddss}{Number}.lua`**。日期使用宿主本地时间，`ss` 是两位秒数；`Number` 从 1 递增并跳过已有文件，不覆盖旧输出。脚本名中无法用于文件名的字符替换为 `_`。
 
 <a id="output"></a>
@@ -112,15 +110,5 @@ local source, info = decompiler.decompile(bytes, {
 </details>
 
 <a id="scope"></a>
-
-## 支持范围
-
-**v0.1.4 · 实验性。** 识别版本 **3–14** 的已知容器布局，支持常见分支、循环与函数结构；不代表覆盖全部指令或保证行为等价。
-
-暂不支持外层加密／压缩、任意 opcode 映射、类指令、`NATIVECALL`、`CMPPROTO` 及无法结构化的控制流。已被移除的注释、类型和原始排版不可恢复。
-
-仅向可信目录写入输出；两种文件接口都不能消除路径竞争。Luau 文件写入不是原子操作，失败可能留下新建的残缺文件。取消配额不代表无限内存：超大输入仍受设备内存、宿主超时和语言栈容量影响。默认接受带警告的 24 字节不透明尾部，不验证签名；严格处理时使用 `--strict-trailing`。
-
----
 
 [MIT License](LICENSE) · Copyright © 2026 LuaUnVeil

@@ -24,7 +24,7 @@ SOFTWARE.
 
 -- Luau bytecode decompiler. Runtime syntax: Lua 5.1; output syntax: Luau.
 -- MIT License. No native modules, bit library, string.unpack or input execution.
-local D = { version = "0.1.0" }
+local D = { version = "0.1.1" }
 local floor, concat, insert = math.floor, table.concat, table.insert
 local function fail(message) error("luau-decompiler: " .. message, 0) end
 local function check(test, message) if not test then fail(message) end end
@@ -44,7 +44,9 @@ local function number(n)
     if n ~= n then return "(0 / 0)" end
     if n == math.huge then return "(1 / 0)" end
     if n == -math.huge then return "(-1 / 0)" end
-    if n == 0 and 1 / n < 0 then return "-0.0" end
+    -- Lua 5.1 interns +0 and -0 as the same constant. Construct negative zero
+    -- through division instead of letting a -0 literal poison positive zeros.
+    if n == 0 and 1 / n < 0 then return "(-1 / (1 / 0))" end
     for p = 1, 17 do local s = string.format("%." .. p .. "g", n); if tonumber(s) == n then return s end end
     return string.format("%.17g", n)
 end
@@ -587,13 +589,11 @@ local function normalize(ctx)
         for j, cap in ipairs(closure.captures) do
             if cap.expr.tag == "ref" then
                 local v = root(cap.expr.value); v.hold = true
-                local hint = ctx.chunk.protos[closure.child + 1].upnames[j]
-                if hint then v.hint = hint end
                 if cap.kind == 0 and (#v.defs > 1 or v.captured) and cap.expr.value.pc ~= closure.pc then
                     local b, position = cap.block, nil
                     for index, s in ipairs(b.stmts) do if s.pc == closure.pc and s.expr == closure then position = index; break end end
                     check(position, "missing closure creation statement")
-                    local snapshot = { id = #ctx.values + 1, reg = -1, kind = "def", pc = closure.pc, block = b, hold = true, hint = hint or "capturedValue" }
+                    local snapshot = { id = #ctx.values + 1, reg = -1, kind = "def", pc = closure.pc, block = b, hold = true }
                     local s = { kind = "assign", expr = cap.expr, outs = { snapshot }, pc = closure.pc, block = b }
                     snapshot.stmt, snapshot.position = s, 1; ctx.values[#ctx.values + 1] = snapshot
                     insert(b.stmts, position, s); cap.expr = ref(snapshot)
@@ -706,12 +706,12 @@ local function structure(ctx)
                 elseif t.kind == "nprep" then
                     local desc = { header = t.body, continue = t.latch, after = t.after, nodes = loops[t.body] and loops[t.body].nodes or {} }
                     local node = { kind = "fornum", initial = t.initial, limit = t.limit, step = t.step, binding = root(t.latch.term.variable), body = emit(t.body, t.latch, desc, depth + 1) }
-                    node.binding.loophint = "index"; add(node); current = t.after
+                    add(node); current = t.after
                 elseif t.kind == "gprep" then
                     local lt = t.latch.term
                     local desc = { header = t.latch, continue = t.latch, after = lt.after, nodes = loops[t.latch] and loops[t.latch].nodes or {} }
                     local node = { kind = "forgen", generator = t.generator, bindings = {}, body = emit(lt.body, t.latch, desc, depth + 1) }
-                    for j, v in ipairs(lt.variables) do node.bindings[j] = root(v); root(v).loophint = j == 1 and "key" or (j == 2 and "value" or "item") end
+                    for j, v in ipairs(lt.variables) do node.bindings[j] = root(v) end
                     add(node); current = lt.after
                 elseif t.kind == "nlatch" or t.kind == "glatch" then
                     check(loop ~= nil, "orphan loop latch at pc " .. t.pc); current = nil
@@ -1018,56 +1018,85 @@ local function optimizeAST(ctx)
     end
     for _ = 1, 3 do visit(ctx.ast) end
 end
-local function hint(e, ctx, depth)
-    depth = (depth or 0) + 1; if not e or depth > 8 then return nil end
-    if e.tag == "global" then return e.name
-    elseif e.tag == "index" then return e.field
-    elseif e.tag == "upvalue" then return ctx.upnames and ctx.upnames[e.index]
-    elseif e.tag == "ref" then
-        local v = root(e.value); if v.hint then return v.hint end
-        if #v.defs == 1 and v.defs[1].stmt then return hint(v.defs[1].stmt.expr, ctx, depth) end
-    elseif e.tag == "closure" then return ctx.chunk.protos[e.child + 1].debugname or "callback"
-    elseif e.tag == "table" then return "result"
-    elseif e.tag == "call" then
-        local fn = e.fn
-        if fn.tag == "method" then
-            local named = { GetService = true, WaitForChild = true, FindFirstChild = true, GetAttribute = true }
-            if named[fn.name] and e.args[1] and e.args[1].string then return e.args[1].string end
-            return fn.name:match("^Get(.+)") or fn.name:match("^Find(.+)") or "result"
-        elseif fn.tag == "index" and fn.field == "new" then return hint(fn.base, ctx, depth) end
-        local name = hint(fn, ctx, depth)
-        if name == "require" and e.args[1] then return hint(e.args[1], ctx, depth) or "module" end
-        if name then return name .. "Result" end
+-- Names are evidence, not descriptions of the value stored in a register.
+-- Associate debug-local intervals with reaching definitions before optimization;
+-- do not guess from adjacent instructions, constants, fields or callee names.
+local function recoverNames(ctx)
+    local function note(v, name)
+        if v and identifier(name) then
+            v.recoveredNames = v.recoveredNames or {}; v.recoveredNames[name] = true
+        end
     end
-    return nil
+    local byreg = {}
+    for _, v in ipairs(ctx.values) do
+        if v.kind == "def" or v.kind == "param" then
+            byreg[v.reg] = byreg[v.reg] or {}; insert(byreg[v.reg], v)
+        end
+    end
+    for _, info in ipairs(ctx.proto.locals) do
+        if identifier(info.name) and info.first < info.last and ctx.proto.bypc[info.first] then
+            local block
+            for _, b in ipairs(ctx.graph.blocks) do
+                if b.pc <= info.first and info.first < b.finish then block = b; break end
+            end
+            if block and block.reachable then
+                local reaching, latest
+                for _, v in ipairs(byreg[info.reg] or {}) do
+                    if v.block == block and v.pc < info.first and (not latest or v.pc > latest) then
+                        reaching, latest = v, v.pc
+                    end
+                    if v.pc >= info.first and v.pc < info.last then note(v, info.name) end
+                end
+                -- The interval starts after initialization. Resolve the register
+                -- at that exact PC, including multi-instruction/multiple locals.
+                reaching = reaching or block.input[info.reg] or ctx.incoming(block, info.reg)
+                note(reaching, info.name)
+            end
+        end
+    end
+    ctx.resolve()
+    for _, closure in ipairs(ctx.closures) do
+        local child = ctx.chunk.protos[closure.child + 1]
+        for j, cap in ipairs(closure.captures) do
+            if cap.expr.tag == "ref" then note(cap.expr.value, child.upnames[j]) end
+        end
+    end
+end
+local function anonymousName(state)
+    local name
+    repeat state.nextLocal = state.nextLocal + 1; name = "local_" .. state.nextLocal
+    until not state.reserved[name]
+    state.reserved[name] = true
+    return name
 end
 local function allocateNames(ctx, upnames)
-    ctx.upnames = upnames or {}; local used, seen = {}, {}
-    for k in pairs(keywords) do used[k] = true end
+    ctx.upnames = upnames or {}
+    local used, active, evidence, ordered = {}, {}, {}, {}
+    for name in pairs(ctx.options._state.globals) do used[name] = true end
     for _, name in ipairs(ctx.upnames) do used[name] = true end
-    used.getfenv, used.select, used.__setlist = true, true, true
-    astwalk(ctx.ast, function(s) visitstatement(s, function(e) if e.tag == "global" and identifier(e.name) then used[e.name] = true end end) end)
-    local function fresh(base)
-        base = (base or "value"):gsub("[^A-Za-z0-9_]", "_")
-        if base == "" or base:match("^%d") then base = "value_" .. base end
-        base = base:sub(1, 1):lower() .. base:sub(2)
-        if keywords[base] then base = base .. "Value" end
-        local name, n = base, 1; while used[name] do n = n + 1; name = base .. n end
-        used[name] = true; return name
-    end
+    local function activate(v) if v then active[root(v)] = true end end
+    for _, v in ipairs(ctx.params) do activate(v) end
+    astwalk(ctx.ast, function(s)
+        visitstatement(s, function(e) if e.tag == "ref" then activate(e.value) end end)
+        for _, v in ipairs(s.outs or {}) do activate(v) end
+        activate(s.binding); for _, v in ipairs(s.bindings or {}) do activate(v) end
+    end)
     for _, v in ipairs(ctx.values) do
         local r = root(v)
-        if not seen[r] then
-            seen[r] = true; local base = r.hint or r.loophint
-            for _, def in ipairs(r.defs) do
-                for _, info in ipairs(ctx.proto.locals) do
-                    if def.reg == info.reg and def.pc <= info.first and info.first - def.pc <= 3 and identifier(info.name) then base = info.name; break end
-                end
-                if not base and def.stmt then base = hint(def.stmt.expr, ctx) end
-            end
-            if r.parameter and not base then base = "arg" .. r.parameter end
-            r.name = fresh(base or "value")
+        if active[r] and not evidence[r] then evidence[r] = {}; ordered[#ordered + 1] = r end
+        if active[r] then
+            for name in pairs(v.recoveredNames or {}) do evidence[r][name] = true end
         end
+    end
+    for _, r in ipairs(ordered) do
+        local recovered, count = nil, 0
+        for name in pairs(evidence[r]) do recovered, count = name, count + 1 end
+        -- Preserve exact spelling/case only when unambiguous and scope-safe.
+        -- Conflicting, invalid or unavailable names get local_X, never suffixes
+        -- such as player2, lowercased names or semantic guesses.
+        if count == 1 and not used[recovered] then r.name = recovered
+        else r.name = anonymousName(ctx.options._state) end
+        used[r.name] = true
     end
 end
 local function planLocals(ctx)
@@ -1260,9 +1289,12 @@ renderBlock = function(block, ctx, level)
             local a = {}; for j, e in ipairs(s.generator) do a[j] = expr(e, j == #s.generator) end
             line("for " .. names(s.bindings) .. " in " .. concat(a, ", ") .. " do"); out[#out + 1] = renderBlock(s.body, ctx, level + 1); line("end")
         elseif s.kind == "setlist" then
-            ctx.options._state.needsSetlist = true
+            local state = ctx.options._state
+            if not state.setlist then
+                state.setlist = {}; for j = 1, 4 do state.setlist[j] = anonymousName(state) end
+            end
             local a = { expr(s.target), tostring(s.first) }; for j, e in ipairs(s.args) do a[#a + 1] = expr(e, j == #s.args) end
-            line("__setlist(" .. concat(a, ", ") .. ")")
+            line(state.setlist[1] .. "(" .. concat(a, ", ") .. ")")
         else fail("cannot print statement " .. s.kind) end
     end
     return concat(out)
@@ -1272,22 +1304,57 @@ buildFunction = function(chunk, p, options, upnames, depth)
     options._state.functions = options._state.functions + 1
     check(options._state.functions <= (options.max_function_expansions or 100000), "closure expansion limit exceeded")
     local ctx = ir(chunk, p, options); ctx.depth, ctx.indent = depth, options.indent or "    "
-    normalize(ctx); optimizeIR(ctx); simplifyGraph(ctx); structure(ctx); optimizeAST(ctx)
+    recoverNames(ctx); normalize(ctx); optimizeIR(ctx); simplifyGraph(ctx); structure(ctx); optimizeAST(ctx)
     allocateNames(ctx, upnames); planLocals(ctx)
     return ctx
 end
 function D.decompile(data, options)
-    options = copy(options or {}); options._state = { functions = 0, needsSetlist = false }
+    options = copy(options or {}); options._state = { functions = 0, nextLocal = 0, reserved = {}, globals = {} }
     check(not options.indent or (type(options.indent) == "string" and options.indent:match("^[ \t]*$")), "indent must contain only spaces/tabs")
     check(not options.vector_size or options.vector_size == 3 or options.vector_size == 4, "vector_size must be 3 or 4")
     local chunk = D.decode(D.parse(data, options), options)
+    local state = options._state
+    local function reserveGlobal(name)
+        if identifier(name) then state.globals[name], state.reserved[name] = true, true end
+    end
+    local function reserveExpression(text)
+        local base = text:gsub("%.[A-Za-z_][A-Za-z0-9_]*", "")
+        if identifier(base) then reserveGlobal(base)
+        else for name in text:gmatch("[A-Za-z_][A-Za-z0-9_]*") do reserveGlobal(name) end end
+    end
+    -- A local in a parent function must not capture an actual global referenced
+    -- only in a nested function. Reserve real names across the entire chunk.
+    for _, p in ipairs(chunk.protos) do
+        for _, i in ipairs(p.instructions) do
+            if i.op == "GETGLOBAL" or i.op == "SETGLOBAL" then
+                local k = p.constants[i.aux]
+                if k and k.tag == 3 then
+                    if identifier(k.value) then reserveGlobal(k.value) else reserveGlobal("getfenv") end
+                end
+            elseif i.op == "SETLIST" then reserveGlobal("select")
+            end
+        end
+        for _, k in pairs(p.constants) do
+            if k.tag == 4 then
+                local first = p.constants[floor(k.value / 1048576) % 1024]
+                if first and first.tag == 3 then
+                    if identifier(first.value) then reserveGlobal(first.value) else reserveGlobal("getfenv") end
+                end
+            elseif k.tag == 7 or k.tag == 11 then reserveExpression(options.vector_constructor or "vector.create")
+            elseif k.tag == 9 and options.integer_constructor then reserveExpression(options.integer_constructor)
+            end
+        end
+        for _, info in ipairs(p.locals) do if identifier(info.name) then state.reserved[info.name] = true end end
+        for _, name in ipairs(p.upnames) do if identifier(name) then state.reserved[name] = true end end
+    end
     local main = chunk.protos[chunk.main + 1]; local upnames = options.upvalue_names or {}
     check(#upnames == main.nups, "root function has external upvalues; provide options.upvalue_names")
-    for _, name in ipairs(upnames) do check(identifier(name), "invalid external upvalue name") end
+    for _, name in ipairs(upnames) do check(identifier(name), "invalid external upvalue name"); state.reserved[name] = true end
     local ctx = buildFunction(chunk, main, options, upnames, 0)
     local source = renderBlock(ctx.ast, ctx, 0)
-    if options._state.needsSetlist then
-        source = "local function __setlist(target, first, ...)\n    for index = 1, select(\"#\", ...) do\n        target[first + index - 1] = select(index, ...)\n    end\nend\n\n" .. source
+    if state.setlist then
+        local fn, target, first, index = state.setlist[1], state.setlist[2], state.setlist[3], state.setlist[4]
+        source = "local function " .. fn .. "(" .. target .. ", " .. first .. ", ...)\n    for " .. index .. " = 1, select(\"#\", ...) do\n        " .. target .. "[" .. first .. " + " .. index .. " - 1] = select(" .. index .. ", ...)\n    end\nend\n\n" .. source
     end
     if options.header ~= false then source = "-- This file was generated by luaunveil.com ;\n\n" .. source end
     check(#source <= (options.max_output_bytes or 67108864), "output exceeds size limit")

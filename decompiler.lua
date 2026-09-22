@@ -24,15 +24,103 @@ SOFTWARE.
 
 -- Luau bytecode decompiler. Runtime syntax: Lua 5.1; output syntax: Luau.
 -- MIT License. No native modules, bit library, string.unpack or input execution.
-local D = { version = "0.1.1" }
+local D = { version = "0.1.2" }
 local floor, concat, insert = math.floor, table.concat, table.insert
-local function fail(message) error("luau-decompiler: " .. message, 0) end
+local function fail(message)
+    -- Bytecode error chunks and file names are untrusted diagnostic text.
+    message = tostring(message)
+    local truncated = #message > 1024
+    message = message:sub(1, 1024):gsub('[%z\1-\31\127-\255]', function(c)
+        return string.format("\\%03d", c:byte())
+    end)
+    error("luau-decompiler: " .. message .. (truncated and " [truncated]" or ""), 0)
+end
 local function check(test, message) if not test then fail(message) end end
 local function copy(t) local o = {}; for k, v in pairs(t) do o[k] = v end; return o end
 local function set(words) local t = {}; for w in words:gmatch("%S+") do t[w] = true end; return t end
 local keywords = set("and break do else elseif end false for function if in local nil not or repeat return then true until while continue type export")
 local function identifier(s) return type(s) == "string" and s:match("^[A-Za-z_][A-Za-z0-9_]*$") and not keywords[s] end
-local function quote(s)
+-- Limits are request-local, finite integers. No debug hooks or global budgets.
+local limits = {
+    max_bytes = { 16777216, 67108864 }, max_strings = { 100000, 1000000 },
+    max_string_bytes = { 1048576, 16777216 }, max_protos = { 10000, 100000 },
+    max_instructions = { 250000, 4000000 }, max_constants = { 100000, 1000000 },
+    max_table_entries = { 200000, 1000000 }, max_debug_entries = { 200000, 1000000 },
+    max_nodes = { 250000, 1000000 }, max_work = { 50000000, 500000000 },
+    max_depth = { 64, 128 }, max_expression_depth = { 128, 256 },
+    max_function_expansions = { 10000, 100000 }, max_output_bytes = { 16777216, 67108864 },
+    max_scope_locals = { 180, 200 }
+}
+local function configure(options)
+    check(options == nil or type(options) == "table", "options must be a table")
+    local o = copy(options or {})
+    for name, bounds in pairs(limits) do
+        local n = o[name]; if n == nil then n = bounds[1] end
+        check(type(n) == "number" and n >= 1 and n <= bounds[2] and n == floor(n), name .. " must be a finite positive integer <= " .. bounds[2])
+        o[name] = n
+    end
+    for _, name in ipairs({ "header", "expression_if", "strict_trailing", "allow_trailing" }) do
+        check(o[name] == nil or type(o[name]) == "boolean", name .. " must be boolean")
+    end
+    check(o.indent == nil or (type(o.indent) == "string" and #o.indent <= 16 and o.indent:match("^[ \t]*$")), "indent must be at most 16 spaces/tabs")
+    check(o.vector_size == nil or o.vector_size == 3 or o.vector_size == 4, "vector_size must be 3 or 4")
+    for _, name in ipairs({ "vector_constructor", "integer_constructor" }) do
+        local text = o[name]
+        if text ~= nil then
+            check(type(text) == "string" and #text <= 256, name .. " must be a qualified identifier")
+            local count = 0
+            for part in text:gmatch("[^.]+") do check(identifier(part), name .. " must be a qualified identifier"); count = count + #part end
+            local _, dots = text:gsub("%.", "")
+            check(count > 0 and count + dots == #text and not text:find("..", 1, true) and text:sub(1, 1) ~= "." and text:sub(-1) ~= ".", name .. " must be a qualified identifier")
+        end
+    end
+    if o.opcode_multiplier ~= nil then
+        local n = o.opcode_multiplier
+        check(type(n) == "number" and n >= 1 and n <= 255 and n == floor(n) and n % 2 == 1, "opcode_multiplier must be odd, 1..255")
+    end
+    if o.upvalue_names ~= nil then
+        check(type(o.upvalue_names) == "table", "upvalue_names must be an array")
+        local names, seen, count = {}, {}, 0
+        for index, name in pairs(o.upvalue_names) do
+            check(type(index) == "number" and index >= 1 and index <= 255 and index == floor(index) and identifier(name), "invalid external upvalue name")
+            check(not seen[name], "external upvalue names must be distinct")
+            names[index], seen[name], count = name, true, count + 1
+        end
+        for i = 1, count do check(names[i], "upvalue_names must be a dense array") end
+        o.upvalue_names = names
+    end
+    o._budget = { work = 0, nodes = 0, constants = 0, entries = 0, debug = 0 }
+    return o
+end
+local function spend(options, amount)
+    local budget = options._budget
+    budget.work = budget.work + (amount or 1)
+    check(budget.work <= options.max_work, "analysis work limit exceeded")
+end
+local function nodes(options, amount)
+    local budget = options._budget
+    budget.nodes = budget.nodes + (amount or 1)
+    check(budget.nodes <= options.max_nodes, "intermediate node limit exceeded")
+    spend(options, amount)
+end
+local function join(options, parts, separator)
+    separator = separator or ""
+    local size = math.max(0, #parts - 1) * #separator
+    for _, part in ipairs(parts) do size = size + #part end
+    check(size <= options.max_output_bytes, "output exceeds size limit")
+    spend(options, #parts + floor(size / 1024))
+    return concat(parts, separator)
+end
+local function quote(s, options)
+    if options then
+        local size = 2
+        for i = 1, #s do
+            local n = s:byte(i)
+            size = size + ((n == 9 or n == 10 or n == 13 or n == 34 or n == 92) and 2 or ((n < 32 or n >= 127) and 4 or 1))
+        end
+        check(size <= options.max_output_bytes, "string literal exceeds output limit")
+        spend(options, #s)
+    end
     return '"' .. s:gsub('[%z\1-\31\127-\255\\"]', function(c)
         local n = c:byte()
         if n == 10 then return "\\n" elseif n == 13 then return "\\r" elseif n == 9 then return "\\t"
@@ -68,7 +156,7 @@ local function reader(data, options)
         fail("unterminated varint")
     end
     function r:count(label, max)
-        local n = self:varint(); check(n <= (max or self.limit), label .. " count exceeds limit"); return n
+        local n = self:varint(); check(n <= (max or self.limit) and n <= self.limit - self.pos + 1, label .. " count exceeds limit"); spend(options, n); return n
     end
     function r:float(bits)
         local lo, hi, mantissa, exponent, sign
@@ -101,16 +189,16 @@ local function reader(data, options)
     end
     return r
 end
-function D.parse(data, options)
-    options = options or {}; check(type(data) == "string", "input must be a byte string")
+local function parse(data, options)
+    check(type(data) == "string", "input must be a byte string")
     check(#data <= (options.max_bytes or 67108864), "input exceeds max_bytes")
     local r = reader(data, options); local version = r:u8()
-    if version == 0 then fail("compiler error: " .. data:sub(2)) end
+    if version == 0 then fail("compiler error: " .. data:sub(2, 1025)) end
     check(version >= 3 and version <= 14, "unsupported bytecode version " .. version .. " (expected 3..14)")
     local types = version >= 4 and r:u8() or 0
     check(version < 4 or (types >= 1 and types <= 3), "unsupported type version " .. types)
     local chunk = { version = version, types = types, strings = {}, protos = {}, warnings = {} }
-    for i = 1, r:count("string", options.max_strings or 1000000) do chunk.strings[i] = r:take(r:count("string byte")) end
+    for i = 1, r:count("string", options.max_strings or 1000000) do chunk.strings[i] = r:take(r:count("string byte", options.max_string_bytes)) end
     local function str() local i = r:varint(); check(i == 0 or chunk.strings[i], "invalid string index " .. i); return chunk.strings[i] end
     if types == 3 then local i = r:u8(); while i ~= 0 do str(); i = r:u8() end end
     local np = r:count("prototype", options.max_protos or 100000)
@@ -119,7 +207,7 @@ function D.parse(data, options)
     for id = 0, np - 1 do
         local size = version >= 12 and r:count("prototype byte") or nil
         local start = r.pos
-        if size then check(start + size - 1 <= #data, "prototype extends past input") end
+        if size then check(start + size - 1 <= #data, "prototype extends past input"); r.limit = start + size - 1 end
         local p = { id = id, stack = r:u8(), params = r:u8(), nups = r:u8(), vararg = r:u8(), constants = {}, children = {}, locals = {}, upnames = {} }
         check(p.stack >= p.params and p.stack <= 255 and p.vararg <= 1, "invalid prototype header " .. id)
         p.flags = version >= 4 and r:u8() or 0
@@ -128,6 +216,8 @@ function D.parse(data, options)
         total = total + p.sizecode; check(total <= (options.max_instructions or 4000000), "total instruction limit exceeded")
         p.code = {}; for pc = 0, p.sizecode - 1 do p.code[pc] = r:u32() end
         p.nconstants = r:count("constant", options.max_constants or 1000000)
+        options._budget.constants = options._budget.constants + p.nconstants
+        check(options._budget.constants <= options.max_constants, "total constant limit exceeded")
         for k = 0, p.nconstants - 1 do
             local tag = r:u8(); local c = { tag = tag }
             if tag == 0 then c.value = nil
@@ -137,7 +227,10 @@ function D.parse(data, options)
             elseif tag == 4 then c.value = r:u32()
             elseif tag == 5 or tag == 8 then
                 c.entries = {}
-                for j = 1, r:count("table entry") do
+                local entries = r:count("table entry", options.max_table_entries)
+                options._budget.entries = options._budget.entries + entries
+                check(options._budget.entries <= options.max_table_entries, "total table entry limit exceeded")
+                for j = 1, entries do
                     local key = r:varint(); local value = tag == 8 and r:i32() or -1
                     check(key < k and (value < 0 or value < k), "forward/out-of-range table constant")
                     c.entries[j] = { key = key, value = value }
@@ -167,7 +260,10 @@ function D.parse(data, options)
         end
         local debug = r:u8(); check(debug <= 1, "invalid debug-info flag")
         if debug == 1 then
-            for j = 1, r:count("debug local") do
+            local count = r:count("debug local", options.max_debug_entries)
+            options._budget.debug = options._budget.debug + count
+            check(options._budget.debug <= options.max_debug_entries, "total debug entry limit exceeded")
+            for j = 1, count do
                 local v = { name = str(), first = r:varint(), last = r:varint(), reg = r:u8() }
                 check(v.first <= v.last and v.last <= p.sizecode and v.reg < p.stack, "invalid local lifetime"); p.locals[j] = v
             end
@@ -183,6 +279,7 @@ function D.parse(data, options)
         if size then
             check(r.pos <= start + size, "prototype size mismatch")
             p.extension = r:take(start + size - r.pos)
+            r.limit = #data
         end
         chunk.protos[id + 1] = p
     end
@@ -195,6 +292,7 @@ function D.parse(data, options)
     chunk.instruction_words = total
     return chunk
 end
+function D.parse(data, options) return parse(data, configure(options)) end
 local opnames = {}
 for name in ("NOP BREAK LOADNIL LOADB LOADN LOADK MOVE GETGLOBAL SETGLOBAL GETUPVAL SETUPVAL CLOSEUPVALS GETIMPORT GETTABLE SETTABLE GETTABLEKS SETTABLEKS GETTABLEN SETTABLEN NEWCLOSURE NAMECALL CALL RETURN JUMP JUMPBACK JUMPIF JUMPIFNOT JUMPIFEQ JUMPIFLE JUMPIFLT JUMPIFNOTEQ JUMPIFNOTLE JUMPIFNOTLT ADD SUB MUL DIV MOD POW ADDK SUBK MULK DIVK MODK POWK AND OR ANDK ORK CONCAT NOT MINUS LENGTH NEWTABLE DUPTABLE SETLIST FORNPREP FORNLOOP FORGLOOP FORGPREP_INEXT FASTCALL3 FORGPREP_NEXT NATIVECALL GETVARARGS DUPCLOSURE PREPVARARGS LOADKX JUMPX FASTCALL COVERAGE CAPTURE SUBRK DIVRK FASTCALL1 FASTCALL2 FASTCALL2K FORGPREP JUMPXEQKNIL JUMPXEQKB JUMPXEQKN JUMPXEQKS IDIV IDIVK GETUDATAKS SETUDATAKS NAMECALLUDATA NEWCLASSMEMBER CALLFB CMPPROTO FASTPCALL NEWCLASS"):gmatch("%S+") do opnames[#opnames + 1] = name end
 local auxiliary = set("GETGLOBAL SETGLOBAL GETIMPORT GETTABLEKS SETTABLEKS NAMECALL JUMPIFEQ JUMPIFLE JUMPIFLT JUMPIFNOTEQ JUMPIFNOTLE JUMPIFNOTLT NEWTABLE SETLIST FORGLOOP FASTCALL3 LOADKX FASTCALL2 FASTCALL2K JUMPXEQKNIL JUMPXEQKB JUMPXEQKN JUMPXEQKS GETUDATAKS SETUDATAKS NAMECALLUDATA NEWCLASSMEMBER CALLFB CMPPROTO NEWCLASS")
@@ -202,10 +300,65 @@ local conditional = set("JUMPIF JUMPIFNOT JUMPIFEQ JUMPIFLE JUMPIFLT JUMPIFNOTEQ
 local unconditional = set("JUMP JUMPBACK JUMPX")
 local forprep = set("FORGPREP FORGPREP_NEXT FORGPREP_INEXT FORNPREP")
 local fast = set("FASTCALL FASTCALL1 FASTCALL2 FASTCALL2K FASTCALL3 FASTPCALL")
-local function decode(chunk, multiplier)
+local registerABC = set("GETTABLE SETTABLE ADD SUB MUL DIV MOD POW AND OR IDIV")
+local registerAB = set("MOVE GETTABLEN SETTABLEN NOT MINUS LENGTH")
+local registerK = set("ADDK SUBK MULK DIVK MODK POWK ANDK ORK IDIVK")
+local property = set("GETTABLEKS SETTABLEKS GETUDATAKS SETUDATAKS NAMECALL NAMECALLUDATA")
+local function validateInstruction(p, i)
+    local op, a, b, c = i.op, i.a, i.b, i.c
+    local function reg(r) check(r >= 0 and r < p.stack, "register out of range in " .. op .. " at pc " .. i.pc) end
+    local function range(r, count) check(r >= 0 and r + count <= p.stack, "register range out of bounds in " .. op .. " at pc " .. i.pc) end
+    local function constant(k, tag)
+        local value = p.constants[k]
+        check(value and (not tag or value.tag == tag), "invalid constant operand in " .. op .. " at pc " .. i.pc)
+        return value
+    end
+    if registerABC[op] then reg(a); reg(b); reg(c)
+    elseif registerAB[op] then reg(a); reg(b)
+    elseif registerK[op] then reg(a); reg(b); constant(c)
+    elseif property[op] then
+        reg(a); reg(b); constant((op == "GETUDATAKS" or op == "SETUDATAKS" or op == "NAMECALLUDATA") and i.aux % 65536 or i.aux, 3)
+        if op == "NAMECALL" or op == "NAMECALLUDATA" then reg(a + 1) end
+    elseif op == "LOADNIL" or op == "LOADN" or op == "NEWCLOSURE" or op == "DUPCLOSURE" then reg(a)
+    elseif op == "LOADB" then reg(a); check(b <= 1, "invalid LOADB boolean")
+    elseif op == "LOADK" or op == "LOADKX" then reg(a); constant(op == "LOADK" and i.d or i.aux)
+    elseif op == "GETGLOBAL" or op == "SETGLOBAL" then reg(a); constant(i.aux, 3)
+    elseif op == "GETUPVAL" or op == "SETUPVAL" then reg(a); check(b < p.nups, "upvalue out of range")
+    elseif op == "GETIMPORT" then
+        reg(a); local k = constant(i.d, 4)
+        check(k.value == i.aux, "GETIMPORT path does not match its constant")
+    elseif op == "CLOSEUPVALS" then range(a, 0)
+    elseif op == "CALL" or op == "CALLFB" then
+        reg(a); if b > 0 then range(a, b) end; if c > 1 then range(a, c - 1) end
+    elseif op == "RETURN" then range(a, b == 0 and 0 or b - 1)
+    elseif op == "GETVARARGS" then check(p.vararg == 1, "GETVARARGS in a nonvariadic function"); range(a, b == 0 and 1 or b - 1)
+    elseif op == "PREPVARARGS" then check(p.vararg == 1 and a == p.params, "invalid PREPVARARGS")
+    elseif op == "NEWTABLE" then reg(a); check(b <= 31, "invalid NEWTABLE hash size")
+    elseif op == "DUPTABLE" then reg(a); local k = constant(i.d); check(k.tag == 5 or k.tag == 8, "invalid DUPTABLE template")
+    elseif op == "SETLIST" then reg(a); range(b, c == 0 and 0 or c - 1); check(i.aux >= 1, "invalid SETLIST index")
+    elseif op == "CONCAT" then reg(a); reg(b); reg(c); check(b <= c, "invalid concatenation range")
+    elseif op == "SUBRK" or op == "DIVRK" then reg(a); constant(b); reg(c)
+    elseif op == "FORNPREP" or op == "FORNLOOP" or forprep[op] then range(a, 3)
+    elseif op == "FORGLOOP" then local n = i.aux % 256; check(n > 0, "empty FORGLOOP result range"); range(a, 3 + n)
+    elseif op == "JUMPIF" or op == "JUMPIFNOT" then reg(a)
+    elseif op == "JUMPXEQKNIL" or op == "JUMPXEQKB" then
+        reg(a); check(i.aux % 2147483648 <= (op == "JUMPXEQKB" and 1 or 0), "invalid comparison flags")
+    elseif op == "JUMPXEQKN" or op == "JUMPXEQKS" then reg(a); constant(i.aux % 16777216, op == "JUMPXEQKN" and 2 or 3)
+    elseif conditional[op] and op ~= "CMPPROTO" then reg(a); reg(i.aux)
+    elseif op == "FASTCALL1" or op == "FASTCALL2" or op == "FASTCALL2K" or op == "FASTCALL3" then
+        reg(b)
+        if op == "FASTCALL2" or op == "FASTCALL3" then reg(i.aux % 256) end
+        if op == "FASTCALL3" then reg(floor(i.aux / 256) % 256) end
+        if op == "FASTCALL2K" then constant(i.aux) end
+    elseif op == "FASTPCALL" then check(a <= 1, "invalid FASTPCALL function")
+    elseif op == "NATIVECALL" or op == "CMPPROTO" or op == "NEWCLASS" or op == "NEWCLASSMEMBER" then fail("unsupported " .. op)
+    end
+end
+local function decode(chunk, multiplier, options)
     for _, p in ipairs(chunk.protos) do
         local instructions, bypc, pc = {}, {}, 0
         while pc < p.sizecode do
+            spend(options)
             local w = p.code[pc]; local op = opnames[(w % 256 * multiplier) % 256 + 1]
             check(op ~= nil, "invalid opcode at prototype " .. p.id .. ", pc " .. pc)
             local d, e = floor(w / 65536), floor(w / 256)
@@ -231,6 +384,7 @@ local function decode(chunk, multiplier)
         end
         check(pc == p.sizecode, "instruction length mismatch")
         for _, i in ipairs(instructions) do
+            validateInstruction(p, i)
             if i.target then check(bypc[i.target] ~= nil or i.target == p.sizecode, "jump into AUX/capture or outside prototype at pc " .. i.pc) end
             if fast[i.op] then
                 local call = bypc[i.pc + 1 + i.c]
@@ -241,17 +395,20 @@ local function decode(chunk, multiplier)
     end
     chunk.opcode_multiplier = multiplier
 end
-function D.decode(chunk, options)
-    options = options or {}
+local function decodeChunk(chunk, options)
     local multiplier = options.opcode_multiplier
-    if multiplier then check(multiplier >= 1 and multiplier <= 255 and multiplier % 2 == 1, "opcode_multiplier must be odd, 1..255"); decode(chunk, multiplier)
+    if multiplier then check(multiplier >= 1 and multiplier <= 255 and multiplier % 2 == 1, "opcode_multiplier must be odd, 1..255"); decode(chunk, multiplier, options)
     else
-        local ok, err = pcall(decode, chunk, 1)
-        if not ok then local encoded, err2 = pcall(decode, chunk, 203); if not encoded then fail("neither plain nor encoded opcodes validated:\n" .. tostring(err) .. "\n" .. tostring(err2)) end end
+        local ok, err = pcall(decode, chunk, 1, options)
+        if not ok then local encoded, err2 = pcall(decode, chunk, 203, options); if not encoded then fail("neither plain nor encoded opcodes validated:\n" .. tostring(err) .. "\n" .. tostring(err2)) end end
     end
     return chunk
 end
-local function cfg(p)
+function D.decode(chunk, options)
+    check(type(chunk) == "table" and type(chunk.protos) == "table", "decode expects a parsed chunk")
+    return decodeChunk(chunk, configure(options))
+end
+local function cfg(p, options)
     local leaders = { [0] = true, [p.sizecode] = true }
     for _, i in ipairs(p.instructions) do
         if i.target then leaders[i.target] = true; leaders[i.next] = true end
@@ -287,7 +444,7 @@ local function cfg(p)
     local queue = { blocks[1] }; blocks[1].reachable = true; local qi = 1
     while qi <= #queue do local b = queue[qi]; qi = qi + 1; for _, s in ipairs(b.succ) do if not s.reachable then s.reachable = true; queue[#queue + 1] = s end end end
     for _, b in ipairs(blocks) do local preds = {}; for _, x in ipairs(b.preds) do if x.reachable then preds[#preds + 1] = x end end; b.preds = preds end
-    return { blocks = blocks, map = map, entry = blocks[1], exit = exit }
+    return { blocks = blocks, map = map, entry = blocks[1], exit = exit, options = options }
 end
 local function literal(text) return { tag = "literal", text = text } end
 local function ref(v) return { tag = "ref", value = v } end
@@ -314,8 +471,12 @@ local function unite(a, b)
     return a
 end
 local function ir(chunk, p, options)
-    local g = cfg(p); local ctx = { chunk = chunk, proto = p, graph = g, values = {}, params = {}, options = options, closures = {} }
+    -- Reserve conservative costs for quadratic data-flow/lexical passes before
+    -- allocating graphs. Actual expression traversal is charged separately.
+    spend(options, p.sizecode * p.sizecode + #p.locals * (p.sizecode + p.stack))
+    local g = cfg(p, options); local ctx = { chunk = chunk, proto = p, graph = g, values = {}, params = {}, options = options, closures = {} }
     local function value(reg, pc, b, kind)
+        nodes(options)
         local v = { id = #ctx.values + 1, reg = reg, pc = pc, block = b, kind = kind }; ctx.values[#ctx.values + 1] = v; return v
     end
     local function incoming(b, reg)
@@ -324,10 +485,10 @@ local function ir(chunk, p, options)
     end
     for r = 0, p.params - 1 do local v = value(r, -1, g.entry, "param"); v.parameter = r + 1; ctx.params[r + 1] = v; g.entry.input[r] = v end
     local function constant(k, depth)
-        depth = (depth or 0) + 1; check(depth <= 100, "constant nesting too deep")
+        depth = (depth or 0) + 1; check(depth <= math.min(100, options.max_expression_depth), "constant nesting too deep"); nodes(options)
         local c = p.constants[k]; check(c, "constant index " .. tostring(k) .. " is out of range in prototype " .. p.id)
         if c.tag == 0 then return literal("nil") elseif c.tag == 1 then return literal(tostring(c.value))
-        elseif c.tag == 2 then return literal(number(c.value)) elseif c.tag == 3 then local e = literal(quote(c.value)); e.string = c.value; return e
+        elseif c.tag == 2 then return literal(number(c.value)) elseif c.tag == 3 then local e = literal(quote(c.value, options)); e.string = c.value; return e
         elseif c.tag == 4 then
             local n, id = floor(c.value / 1073741824), c.value; local e
             check(n >= 1 and n <= 3, "invalid import path")
@@ -335,7 +496,7 @@ local function ir(chunk, p, options)
             for j = 1, n do
                 local key = p.constants[indices[j]]; check(key and key.tag == 3, "invalid import key")
                 if j == 1 then e = { tag = "global", name = key.value }
-                else e = { tag = "index", base = e, key = literal(quote(key.value)), field = key.value } end
+                else e = { tag = "index", base = e, key = literal(quote(key.value, options)), field = key.value } end
             end
             return e
         elseif c.tag == 5 or c.tag == 8 then
@@ -347,7 +508,7 @@ local function ir(chunk, p, options)
             return { tag = "call", fn = { tag = "raw", text = options.vector_constructor or "vector.create" }, args = a, single = true }
         elseif c.tag == 9 then
             check(options.integer_constructor, "integer constant requires options.integer_constructor; refusing double-precision rounding")
-            return { tag = "call", fn = { tag = "raw", text = options.integer_constructor }, args = { literal(quote(c.value)) }, single = true }
+            return { tag = "call", fn = { tag = "raw", text = options.integer_constructor }, args = { literal(quote(c.value, options)) }, single = true }
         end
         fail("constant kind cannot be used as a literal: " .. c.tag)
     end
@@ -359,7 +520,7 @@ local function ir(chunk, p, options)
                 check(r == 256 or (r >= 0 and r < p.stack), "register out of range in prototype " .. p.id .. ", pc " .. b.pc .. ": " .. r)
                 return ref(regs[r] or incoming(b, r))
             end
-            local function stmt(s, i) s.pc, s.block = i.pc, b; b.stmts[#b.stmts + 1] = s; return s end
+            local function stmt(s, i) nodes(options); s.pc, s.block = i.pc, b; b.stmts[#b.stmts + 1] = s; return s end
             local function assign(r, e, i, count)
                 local s = stmt({ kind = "assign", expr = e, outs = {} }, i)
                 for j = 0, (count or 1) - 1 do
@@ -485,7 +646,7 @@ local function ir(chunk, p, options)
                 local v = cap.expr.value; root(v).captured = true
                 local queue, seen = { { b = cap.block, pc = cap.pc } }, {}; local q = 1
                 while q <= #queue do
-                    local item = queue[q]; q = q + 1; local b, stop = item.b, false
+                    local item = queue[q]; q = q + 1; local b, stop = item.b, false; spend(options, #b.stmts + 1)
                     local key = b.id .. ":" .. item.pc
                     if not seen[key] then
                         seen[key] = true
@@ -514,25 +675,29 @@ local function ir(chunk, p, options)
     end
     return ctx
 end
-local function walk(e, visit)
+local function walk(e, visit, options, depth)
     if not e then return e end
+    depth = (depth or 0) + 1
+    check(depth <= options.max_expression_depth, "expression nesting limit exceeded")
+    spend(options)
     local replacement = visit(e); if replacement then return replacement end
-    if e.tag == "binary" then e.a, e.b = walk(e.a, visit), walk(e.b, visit)
-    elseif e.tag == "ifexpr" then e.cond, e.yes, e.no = walk(e.cond, visit), walk(e.yes, visit), walk(e.no, visit)
-    elseif e.tag == "unary" then e.a = walk(e.a, visit)
-    elseif e.tag == "index" then e.base, e.key = walk(e.base, visit), walk(e.key, visit)
-    elseif e.tag == "call" then e.fn = walk(e.fn, visit); for j, v in ipairs(e.args) do e.args[j] = walk(v, visit) end
-    elseif e.tag == "method" then e.object = walk(e.object, visit)
-    elseif e.tag == "table" then for _, entry in ipairs(e.entries) do entry.key, entry.value = walk(entry.key, visit), walk(entry.value, visit) end
-    elseif e.tag == "closure" then for _, cap in ipairs(e.captures) do cap.expr = walk(cap.expr, visit) end end
+    local function child(x) return walk(x, visit, options, depth) end
+    if e.tag == "binary" then e.a, e.b = child(e.a), child(e.b)
+    elseif e.tag == "ifexpr" then e.cond, e.yes, e.no = child(e.cond), child(e.yes), child(e.no)
+    elseif e.tag == "unary" then e.a = child(e.a)
+    elseif e.tag == "index" then e.base, e.key = child(e.base), child(e.key)
+    elseif e.tag == "call" then e.fn = child(e.fn); for j, v in ipairs(e.args) do e.args[j] = child(v) end
+    elseif e.tag == "method" then e.object = child(e.object)
+    elseif e.tag == "table" then for _, entry in ipairs(e.entries) do entry.key, entry.value = child(entry.key), child(entry.value) end
+    elseif e.tag == "closure" then for _, cap in ipairs(e.captures) do cap.expr = child(cap.expr) end end
     return e
 end
-local function visitstatement(s, visit)
-    s.expr, s.lhs, s.target = walk(s.expr, visit), walk(s.lhs, visit), walk(s.target, visit)
-    for i, e in ipairs(s.args or {}) do s.args[i] = walk(e, visit) end
-    s.cond = walk(s.cond, visit)
-    s.initial, s.limit, s.step = walk(s.initial, visit), walk(s.limit, visit), walk(s.step, visit)
-    for i, e in ipairs(s.generator or {}) do s.generator[i] = walk(e, visit) end
+local function visitstatement(s, visit, options)
+    s.expr, s.lhs, s.target = walk(s.expr, visit, options), walk(s.lhs, visit, options), walk(s.target, visit, options)
+    for i, e in ipairs(s.args or {}) do s.args[i] = walk(e, visit, options) end
+    s.cond = walk(s.cond, visit, options)
+    s.initial, s.limit, s.step = walk(s.initial, visit, options), walk(s.limit, visit, options), walk(s.step, visit, options)
+    for i, e in ipairs(s.generator or {}) do s.generator[i] = walk(e, visit, options) end
 end
 local function groups(ctx)
     for _, v in ipairs(ctx.values) do local r = root(v); r.defs, r.uses, r.sites = {}, 0, {} end
@@ -546,7 +711,7 @@ local function groups(ctx)
             local function count(s)
                 visitstatement(s, function(e)
                     if e.tag == "ref" then local v = root(e.value); v.uses = v.uses + 1; v.sites[#v.sites + 1] = s end
-                end)
+                end, ctx.options)
             end
             for _, s in ipairs(b.stmts) do if not s.removed and s.kind ~= "close" and not s.synthetic then count(s) end end
             if b.term then count(b.term) end
@@ -604,9 +769,11 @@ local function normalize(ctx)
     groups(ctx)
 end
 local function dominators(graph, reverse)
+    local options = graph.options
     local start = reverse and graph.exit or graph.entry
     local seen, post, stack = { [start] = true }, {}, { { b = start, index = 1 } }
     while #stack > 0 do
+        spend(options)
         local item = stack[#stack]; local edges = reverse and item.b.preds or item.b.succ
         local next = edges[item.index]; item.index = item.index + 1
         if next then
@@ -617,8 +784,8 @@ local function dominators(graph, reverse)
     local idom = { [start] = start }
     local function intersect(a, b)
         while a ~= b do
-            while index[a] > index[b] do a = idom[a] end
-            while index[b] > index[a] do b = idom[b] end
+            while index[a] > index[b] do spend(options); a = idom[a] end
+            while index[b] > index[a] do spend(options); b = idom[b] end
         end
         return a
     end
@@ -627,7 +794,7 @@ local function dominators(graph, reverse)
         changed, iterations = false, iterations + 1; check(iterations <= #order * 2 + 10, "dominator analysis did not converge")
         for j = 2, #order do
             local b, d = order[j], nil
-            for _, pred in ipairs(reverse and b.succ or b.preds) do if idom[pred] then d = d and intersect(d, pred) or pred end end
+            for _, pred in ipairs(reverse and b.succ or b.preds) do spend(options); if idom[pred] then d = d and intersect(d, pred) or pred end end
             if idom[b] ~= d then idom[b], changed = d, true end
         end
     end
@@ -637,7 +804,7 @@ local function structure(ctx)
     local g = ctx.graph; local idom = dominators(g, false); local postdom = dominators(g, true)
     local loops, reserved = {}, {}
     local function dominates(a, b)
-        while b and b ~= a do local prev = idom[b]; if prev == b then return false end; b = prev end
+        while b and b ~= a do spend(ctx.options); local prev = idom[b]; if prev == b then return false end; b = prev end
         return b == a
     end
     for _, b in ipairs(g.blocks) do
@@ -647,6 +814,7 @@ local function structure(ctx)
                 loop.latches[b] = true
                 local queue = { b }; local q = 1
                 while q <= #queue do
+                    spend(ctx.options)
                     local node = queue[q]; q = q + 1
                     if not loop.nodes[node] then
                         loop.nodes[node] = true
@@ -684,7 +852,7 @@ local function structure(ctx)
         depth = depth or 0
         check(depth < (ctx.options.max_depth or 200), "control-flow nesting limit exceeded in proto " .. ctx.proto.id .. " start " .. tostring(start and start.pc) .. " stop " .. tostring(stop and stop.pc) .. " loop " .. tostring(loop and loop.header.pc))
         local out, current, seen = newblock(), start, {}
-        local function add(s) generated = generated + 1; check(generated <= (ctx.options.max_nodes or 1000000), "structured output expansion limit exceeded"); out.body[#out.body + 1] = copy(s) end
+        local function add(s) nodes(ctx.options); generated = generated + 1; check(generated <= (ctx.options.max_nodes or 1000000), "structured output expansion limit exceeded"); out.body[#out.body + 1] = copy(s) end
         local function action(target)
             if loop and target == loop.after then return "break" end
             if loop and target == loop.continue then return "continue" end
@@ -758,35 +926,37 @@ local function stable(e)
     if e.tag == "ref" then local v = root(e.value); return #v.defs == 1 and not v.captured end
     return false
 end
-local function effect(e)
+local function effect(e, options, depth)
+    depth = (depth or 0) + 1; check(depth <= options.max_expression_depth, "expression nesting limit exceeded"); spend(options)
     if not e then return false end
     if e.tag == "literal" or e.tag == "ref" then return false end
-    if e.tag == "unary" and e.op == "not" then return effect(e.a) end
-    if e.tag == "binary" and (e.op == "and" or e.op == "or") then return effect(e.a) or effect(e.b) end
+    if e.tag == "unary" and e.op == "not" then return effect(e.a, options, depth) end
+    if e.tag == "binary" and (e.op == "and" or e.op == "or") then return effect(e.a, options, depth) or effect(e.b, options, depth) end
     return true
 end
-local function evalorder(e, visit, conditionalDepth)
+local function evalorder(e, visit, conditionalDepth, options, depth)
+    depth = (depth or 0) + 1; check(depth <= options.max_expression_depth, "expression nesting limit exceeded"); spend(options)
     if not e then return end
     local d = conditionalDepth or 0
     if e.tag == "ref" then visit(e, d, "read")
     elseif e.tag == "binary" then
-        evalorder(e.a, visit, d); evalorder(e.b, visit, d + ((e.op == "and" or e.op == "or") and 1 or 0))
+        evalorder(e.a, visit, d, options, depth); evalorder(e.b, visit, d + ((e.op == "and" or e.op == "or") and 1 or 0), options, depth)
         if e.op ~= "and" and e.op ~= "or" then visit(e, d, "effect") end
-    elseif e.tag == "ifexpr" then evalorder(e.cond, visit, d); evalorder(e.yes, visit, d + 1); evalorder(e.no, visit, d + 1)
-    elseif e.tag == "unary" then evalorder(e.a, visit, d); if e.op ~= "not" then visit(e, d, "effect") end
-    elseif e.tag == "index" then evalorder(e.base, visit, d); evalorder(e.key, visit, d); visit(e, d, "effect")
-    elseif e.tag == "call" then evalorder(e.fn, visit, d); for _, a in ipairs(e.args) do evalorder(a, visit, d) end; visit(e, d, "effect")
-    elseif e.tag == "method" then evalorder(e.object, visit, d); visit(e, d, "effect")
-    elseif e.tag == "table" then for _, p in ipairs(e.entries) do evalorder(p.key, visit, d); evalorder(p.value, visit, d) end; visit(e, d, "effect")
-    elseif e.tag == "closure" then for _, c in ipairs(e.captures) do evalorder(c.expr, visit, d + 1) end; visit(e, d, "effect")
+    elseif e.tag == "ifexpr" then evalorder(e.cond, visit, d, options, depth); evalorder(e.yes, visit, d + 1, options, depth); evalorder(e.no, visit, d + 1, options, depth)
+    elseif e.tag == "unary" then evalorder(e.a, visit, d, options, depth); if e.op ~= "not" then visit(e, d, "effect") end
+    elseif e.tag == "index" then evalorder(e.base, visit, d, options, depth); evalorder(e.key, visit, d, options, depth); visit(e, d, "effect")
+    elseif e.tag == "call" then evalorder(e.fn, visit, d, options, depth); for _, a in ipairs(e.args) do evalorder(a, visit, d, options, depth) end; visit(e, d, "effect")
+    elseif e.tag == "method" then evalorder(e.object, visit, d, options, depth); visit(e, d, "effect")
+    elseif e.tag == "table" then for _, p in ipairs(e.entries) do evalorder(p.key, visit, d, options, depth); evalorder(p.value, visit, d, options, depth) end; visit(e, d, "effect")
+    elseif e.tag == "closure" then for _, c in ipairs(e.captures) do evalorder(c.expr, visit, d + 1, options, depth) end; visit(e, d, "effect")
     elseif e.tag ~= "literal" then visit(e, d, "effect") end
 end
-local function statementorder(s, visit)
-    if s.lhs and s.lhs.tag == "index" then evalorder(s.lhs.base, visit); evalorder(s.lhs.key, visit) end
-    evalorder(s.expr, visit); evalorder(s.target, visit)
-    for _, e in ipairs(s.args or {}) do evalorder(e, visit) end
-    evalorder(s.cond, visit); evalorder(s.initial, visit); evalorder(s.limit, visit); evalorder(s.step, visit)
-    for _, e in ipairs(s.generator or {}) do evalorder(e, visit) end
+local function statementorder(s, visit, options)
+    if s.lhs and s.lhs.tag == "index" then evalorder(s.lhs.base, visit, nil, options); evalorder(s.lhs.key, visit, nil, options) end
+    evalorder(s.expr, visit, nil, options); evalorder(s.target, visit, nil, options)
+    for _, e in ipairs(s.args or {}) do evalorder(e, visit, nil, options) end
+    evalorder(s.cond, visit, nil, options); evalorder(s.initial, visit, nil, options); evalorder(s.limit, visit, nil, options); evalorder(s.step, visit, nil, options)
+    for _, e in ipairs(s.generator or {}) do evalorder(e, visit, nil, options) end
 end
 local function optimizeIR(ctx)
     for pass = 1, 5 do
@@ -800,8 +970,9 @@ local function optimizeIR(ctx)
                         if (e.tag == "literal" or (e.tag == "ref" and stable(e))) and not s.open then
                             local function replace(x) if x.tag == "ref" and root(x.value) == v then return e end end
                             for _, block in ipairs(ctx.graph.blocks) do
-                                for _, st in ipairs(block.stmts) do if not st.removed then visitstatement(st, replace) end end
-                                if block.term then visitstatement(block.term, replace) end
+                                spend(ctx.options, #block.stmts + 1)
+                                for _, st in ipairs(block.stmts) do if not st.removed then visitstatement(st, replace, ctx.options) end end
+                                if block.term then visitstatement(block.term, replace, ctx.options) end
                             end
                             s.removed, changed = true, true
                         elseif v.uses == 1 then
@@ -822,16 +993,16 @@ local function optimizeIR(ctx)
                                 statementorder(target, function(x, conditionalDepth, kind)
                                     if x.tag == "ref" and root(x.value) == v then
                                         found = true
-                                        if before or (conditionalDepth > 0 and effect(e)) then safe = false end
+                                        if before or (conditionalDepth > 0 and effect(e, ctx.options)) then safe = false end
                                     elseif not found and kind == "effect" then before = true end
-                                end)
+                                end, ctx.options)
                                 if e.tag == "closure" and ctx.chunk.protos[e.child + 1].debugname then safe = false end
                                 if safe and found then
-                                    visitstatement(target, function(x) if x.tag == "ref" and root(x.value) == v then return e end end)
+                                    visitstatement(target, function(x) if x.tag == "ref" and root(x.value) == v then return e end end, ctx.options)
                                     s.removed, s.movedTo, changed = true, target, true
                                 end
                             end
-                        elseif v.uses == 0 and not effect(e) then s.removed, changed = true, true end
+                        elseif v.uses == 0 and not effect(e, ctx.options) then s.removed, changed = true, true end
                     end
                 end
             end
@@ -901,8 +1072,9 @@ local function childblocks(s)
     if s.kind == "do" or s.kind == "while" or s.kind == "repeat" or s.kind == "fornum" or s.kind == "forgen" then return { s.body } end
     return {}
 end
-local function astwalk(block, fn)
-    for _, s in ipairs(block.body) do fn(s, block); for _, c in ipairs(childblocks(s)) do astwalk(c, fn) end end
+local function astwalk(block, fn, options, depth)
+    depth = (depth or 0) + 1; check(depth <= options.max_depth * 2, "AST nesting limit exceeded")
+    for _, s in ipairs(block.body) do spend(options); fn(s, block); for _, c in ipairs(childblocks(s)) do astwalk(c, fn, options, depth) end end
 end
 local function samebody(a, b)
     if #a.body ~= #b.body then return false end
@@ -948,7 +1120,7 @@ local function optimizeAST(ctx)
                     if prev and prev.kind == "assign" and #prev.outs == 1 and root(prev.outs[1]) == root(yes.outs[1]) and prev.expr.tag == "literal" and not root(prev.outs[1]).captured and not root(prev.outs[1]).hold then
                         local used = false
                         local function readsPrevious(e) if e.tag == "ref" and root(e.value) == root(prev.outs[1]) then used = true end end
-                        walk(s.cond, readsPrevious); walk(yes.expr, readsPrevious)
+                        walk(s.cond, readsPrevious, ctx.options); walk(yes.expr, readsPrevious, ctx.options)
                         if not used then out[#out] = nil; s = { kind = "assign", outs = yes.outs, expr = boolselect(s.cond, yes.expr, prev.expr), pc = s.pc } end
                     end
                 end
@@ -981,7 +1153,7 @@ local function optimizeAST(ctx)
                 end
                 if last and last.kind == "continue" then s.body.body[#s.body.body] = nil end
             end
-            if not (s.kind == "if" and #s.yes.body == 0 and #s.no.body == 0 and not effect(s.cond)) then out[#out + 1] = s end
+            if not (s.kind == "if" and #s.yes.body == 0 and #s.no.body == 0 and not effect(s.cond, ctx.options)) then out[#out + 1] = s end
             if s.kind == "return" or s.kind == "break" or s.kind == "continue" then break end
         end
         -- Reassemble consecutive writes to an unescaped, newly-created table.
@@ -998,14 +1170,15 @@ local function optimizeAST(ctx)
                     local lhs = next.lhs
                     if next.kind ~= "store" or not lhs or lhs.tag ~= "index" or lhs.base.tag ~= "ref" or root(lhs.base.value) ~= target or lhs.key.tag ~= "literal" then break end
                     local selfRead = false
-                    walk(next.expr, function(e) if e.tag == "ref" and root(e.value) == target then selfRead = true end end)
+                    walk(next.expr, function(e) if e.tag == "ref" and root(e.value) == target then selfRead = true end end, ctx.options)
                     if selfRead or target.captured or target.hold then break end
                     local duplicate
+                    spend(ctx.options, #entries)
                     for j, entry in ipairs(entries) do
                         if entry.key and entry.key.tag == "literal" and entry.key.text == lhs.key.text then duplicate = j; break end
                     end
                     if duplicate then
-                        if effect(entries[duplicate].value) then break end
+                        if effect(entries[duplicate].value, ctx.options) then break end
                         table.remove(entries, duplicate)
                     end
                     entries[#entries + 1] = { key = lhs.key, value = next.expr }
@@ -1077,10 +1250,10 @@ local function allocateNames(ctx, upnames)
     local function activate(v) if v then active[root(v)] = true end end
     for _, v in ipairs(ctx.params) do activate(v) end
     astwalk(ctx.ast, function(s)
-        visitstatement(s, function(e) if e.tag == "ref" then activate(e.value) end end)
+        visitstatement(s, function(e) if e.tag == "ref" then activate(e.value) end end, ctx.options)
         for _, v in ipairs(s.outs or {}) do activate(v) end
         activate(s.binding); for _, v in ipairs(s.bindings or {}) do activate(v) end
-    end)
+    end, ctx.options)
     for _, v in ipairs(ctx.values) do
         local r = root(v)
         if active[r] and not evidence[r] then evidence[r] = {}; ordered[#ordered + 1] = r end
@@ -1114,13 +1287,13 @@ local function planLocals(ctx)
         for _, s in ipairs(block.body) do
             local repeatCondition = s.kind == "repeat" and s.cond
             if repeatCondition then s.cond = nil end
-            visitstatement(s, function(e) if e.tag == "ref" then use(e.value, block) end end)
+            visitstatement(s, function(e) if e.tag == "ref" then use(e.value, block) end end, ctx.options)
             if repeatCondition then s.cond = repeatCondition end
             for _, v in ipairs(s.outs or {}) do use(v, block) end
             if s.kind == "fornum" then bindings[s.binding] = s.body
             elseif s.kind == "forgen" then for _, v in ipairs(s.bindings) do bindings[v] = s.body end end
             for _, child in ipairs(childblocks(s)) do traverse(child, block, s) end
-            if repeatCondition then walk(repeatCondition, function(e) if e.tag == "ref" then use(e.value, s.body) end end) end
+            if repeatCondition then walk(repeatCondition, function(e) if e.tag == "ref" then use(e.value, s.body) end end, ctx.options) end
         end
     end
     -- SSA names have short logical lifetimes, but hundreds of sequential
@@ -1168,17 +1341,17 @@ local function planLocals(ctx)
             s.predeclare, s.localouts = {}, nil
             local needed = {}
             local function collect(node)
-                visitstatement(node, function(e) if e.tag == "ref" then local v = root(e.value); if pending[v] then needed[v] = true end end end)
+                visitstatement(node, function(e) if e.tag == "ref" then local v = root(e.value); if pending[v] then needed[v] = true end end end, ctx.options)
                 for _, v in ipairs(node.outs or {}) do v = root(v); if pending[v] then needed[v] = true end end
             end
             collect(s)
-            for _, child in ipairs(childblocks(s)) do astwalk(child, collect) end
+            for _, child in ipairs(childblocks(s)) do astwalk(child, collect, ctx.options) end
             local allNew = s.kind == "assign" and #s.outs > 0
             if allNew then
                 for _, v in ipairs(s.outs) do if not pending[root(v)] then allNew = false end end
                 -- A recursive closure must see the new local, not a global.
                 local selfRead = false
-                walk(s.expr, function(e) if e.tag == "ref" then for _, v in ipairs(s.outs) do if root(e.value) == root(v) then selfRead = true end end end end)
+                walk(s.expr, function(e) if e.tag == "ref" then for _, v in ipairs(s.outs) do if root(e.value) == root(v) then selfRead = true end end end end, ctx.options)
                 if selfRead and s.expr.tag ~= "closure" then allNew = false end
                 if selfRead and s.expr.tag == "closure" and #s.outs ~= 1 then allNew = false end
             end
@@ -1194,23 +1367,26 @@ local function planLocals(ctx)
 end
 local buildFunction, renderBlock, expression
 local precedence = { ["or"] = 1, ["and"] = 2, ["=="] = 3, ["~="] = 3, ["<"] = 3, [">"] = 3, ["<="] = 3, [">="] = 3, [".."] = 4, ["+"] = 5, ["-"] = 5, ["*"] = 6, ["/"] = 6, ["//"] = 6, ["%"] = 6, ["^"] = 8 }
-expression = function(e, ctx, level, parent, tail)
+expression = function(e, ctx, level, parent, tail, depth)
+    depth = (depth or 0) + 1
+    check(depth <= ctx.options.max_expression_depth and level <= ctx.options.max_depth * 2, "source nesting limit exceeded")
+    spend(ctx.options)
     check(e, "missing expression")
+    local function concat(parts, sep) return join(ctx.options, parts, sep) end
     parent = parent or 0; local text, prec = nil, 10
-    local function render(x, p, t) return expression(x, ctx, level, p or 0, t) end
+    local function render(x, p, t) return expression(x, ctx, level, p or 0, t, depth) end
     local function prefix(x)
-        local s = render(x, 9)
-        if x.tag == "literal" or x.tag == "table" or x.tag == "closure" or x.tag == "ifexpr" then s = "(" .. render(x) .. ")" end
-        return s
+        if x.tag == "literal" or x.tag == "table" or x.tag == "closure" or x.tag == "ifexpr" then return concat({ "(", render(x), ")" }) end
+        return render(x, 9)
     end
     if e.tag == "literal" or e.tag == "raw" then text = e.text
     elseif e.tag == "ref" then text = root(e.value).name
-    elseif e.tag == "global" then text = identifier(e.name) and e.name or ("getfenv()[" .. quote(e.name) .. "]")
+    elseif e.tag == "global" then text = identifier(e.name) and e.name or ("getfenv()[" .. quote(e.name, ctx.options) .. "]")
     elseif e.tag == "upvalue" then text = ctx.upnames[e.index]; check(text, "unbound upvalue " .. e.index)
     elseif e.tag == "index" then text = prefix(e.base) .. (identifier(e.field) and ("." .. e.field) or ("[" .. render(e.key) .. "]")); prec = 9
     elseif e.tag == "binary" then
         prec = precedence[e.op]; local right = e.op == "^" or e.op == ".."
-        text = render(e.a, prec + (right and 1 or 0)) .. " " .. e.op .. " " .. render(e.b, prec + (right and 0 or 1))
+        text = concat({ render(e.a, prec + (right and 1 or 0)), " ", e.op, " ", render(e.b, prec + (right and 0 or 1)) })
     elseif e.tag == "unary" then
         prec = 7; local s = render(e.a, prec)
         if e.op == "-" and s:sub(1, 1) == "-" then s = "(" .. s .. ")" end
@@ -1241,12 +1417,19 @@ expression = function(e, ctx, level, parent, tail)
         local body = renderBlock(child.ast, child, level + 1)
         text = "function(" .. concat(params, ", ") .. ")\n" .. body .. string.rep(ctx.indent, level) .. "end"
     else fail("cannot print expression " .. tostring(e.tag)) end
-    if prec < parent then return "(" .. text .. ")" end
+    check(#text <= ctx.options.max_output_bytes, "expression exceeds output limit")
+    if prec < parent then return concat({ "(", text, ")" }) end
     return text
 end
 renderBlock = function(block, ctx, level)
-    local out = {}; local ind = string.rep(ctx.indent, level)
-    local function line(s) out[#out + 1] = ind .. s .. "\n" end
+    check(level <= ctx.options.max_depth * 2, "source nesting limit exceeded")
+    local out, bytes = {}, 0; local ind = string.rep(ctx.indent, level)
+    local function append(s)
+        bytes = bytes + #s; check(bytes <= ctx.options.max_output_bytes, "output exceeds size limit")
+        out[#out + 1] = s
+    end
+    local function line(s) spend(ctx.options); append(join(ctx.options, { ind, s, "\n" })) end
+    local function concat(parts, sep) return join(ctx.options, parts, sep) end
     local function expr(e, tail) return expression(e, ctx, level, 0, tail) end
     local function names(values) local a = {}; for j, v in ipairs(values) do a[j] = root(v).name end; return concat(a, ", ") end
     local function declarations(values)
@@ -1271,23 +1454,23 @@ renderBlock = function(block, ctx, level)
             local current, initial = s, true
             while true do
                 line((initial and "if " or "elseif ") .. expr(current.cond) .. " then")
-                out[#out + 1] = renderBlock(current.yes, ctx, level + 1)
+                append(renderBlock(current.yes, ctx, level + 1))
                 if #current.no.body == 1 and current.no.body[1].kind == "if" and #(current.no.body[1].predeclare or {}) == 0 then current, initial = current.no.body[1], false
                 else
-                    if #current.no.body > 0 then line("else"); out[#out + 1] = renderBlock(current.no, ctx, level + 1) end
+                    if #current.no.body > 0 then line("else"); append(renderBlock(current.no, ctx, level + 1)) end
                     line("end"); break
                 end
             end
-        elseif s.kind == "do" then line("do"); out[#out + 1] = renderBlock(s.body, ctx, level + 1); line("end")
-        elseif s.kind == "while" then line("while " .. expr(s.cond) .. " do"); out[#out + 1] = renderBlock(s.body, ctx, level + 1); line("end")
-        elseif s.kind == "repeat" then line("repeat"); out[#out + 1] = renderBlock(s.body, ctx, level + 1); line("until " .. expr(s.cond))
+        elseif s.kind == "do" then line("do"); append(renderBlock(s.body, ctx, level + 1)); line("end")
+        elseif s.kind == "while" then line("while " .. expr(s.cond) .. " do"); append(renderBlock(s.body, ctx, level + 1)); line("end")
+        elseif s.kind == "repeat" then line("repeat"); append(renderBlock(s.body, ctx, level + 1)); line("until " .. expr(s.cond))
         elseif s.kind == "fornum" then
             local step = s.step.tag == "literal" and s.step.text == "1" and "" or (", " .. expr(s.step))
             line("for " .. s.binding.name .. " = " .. expr(s.initial) .. ", " .. expr(s.limit) .. step .. " do")
-            out[#out + 1] = renderBlock(s.body, ctx, level + 1); line("end")
+            append(renderBlock(s.body, ctx, level + 1)); line("end")
         elseif s.kind == "forgen" then
             local a = {}; for j, e in ipairs(s.generator) do a[j] = expr(e, j == #s.generator) end
-            line("for " .. names(s.bindings) .. " in " .. concat(a, ", ") .. " do"); out[#out + 1] = renderBlock(s.body, ctx, level + 1); line("end")
+            line("for " .. names(s.bindings) .. " in " .. concat(a, ", ") .. " do"); append(renderBlock(s.body, ctx, level + 1)); line("end")
         elseif s.kind == "setlist" then
             local state = ctx.options._state
             if not state.setlist then
@@ -1309,10 +1492,8 @@ buildFunction = function(chunk, p, options, upnames, depth)
     return ctx
 end
 function D.decompile(data, options)
-    options = copy(options or {}); options._state = { functions = 0, nextLocal = 0, reserved = {}, globals = {} }
-    check(not options.indent or (type(options.indent) == "string" and options.indent:match("^[ \t]*$")), "indent must contain only spaces/tabs")
-    check(not options.vector_size or options.vector_size == 3 or options.vector_size == 4, "vector_size must be 3 or 4")
-    local chunk = D.decode(D.parse(data, options), options)
+    options = configure(options); options._state = { functions = 0, nextLocal = 0, reserved = {}, globals = {} }
+    local chunk = decodeChunk(parse(data, options), options)
     local state = options._state
     local function reserveGlobal(name)
         if identifier(name) then state.globals[name], state.reserved[name] = true, true end
@@ -1358,16 +1539,16 @@ function D.decompile(data, options)
     end
     if options.header ~= false then source = "-- This file was generated by luaunveil.com ;\n\n" .. source end
     check(#source <= (options.max_output_bytes or 67108864), "output exceeds size limit")
-    return source, { version = chunk.version, type_version = chunk.types, prototypes = #chunk.protos, instruction_words = chunk.instruction_words, opcode_multiplier = chunk.opcode_multiplier, trailing_bytes = #chunk.trailing, warnings = chunk.warnings, decompiler_version = D.version }
+    return source, { version = chunk.version, type_version = chunk.types, prototypes = #chunk.protos, instruction_words = chunk.instruction_words, opcode_multiplier = chunk.opcode_multiplier, trailing_bytes = #chunk.trailing, warnings = chunk.warnings, decompiler_version = D.version, work_units = options._budget.work, intermediate_nodes = options._budget.nodes }
 end
 
 
 -- File I/O belongs to this optional command-line adapter. The core module does
 -- not require io, os, package, loadstring, debug or any host bytecode executor.
 function D.main(arguments)
-    local input, output, options = nil, nil, {}
+    local input, output, options, overwrite = nil, nil, {}, false
     local function usage()
-        print("Usage: lua5.1 decompiler.lua INPUT [-o OUTPUT] [--opcodes auto|plain|roblox] [--no-header] [--strict-trailing]")
+        print("Usage: lua5.1 decompiler.lua INPUT [-o OUTPUT] [--opcodes auto|plain|roblox] [--no-header] [--strict-trailing] [--force]")
         print("INPUT/OUTPUT may be '-' for stdin/stdout. Luau hosts: require the module and call decompile(bytes).")
     end
     local index = 1
@@ -1381,6 +1562,7 @@ function D.main(arguments)
             index = index + 1; local mode = arguments[index]
             check(mode == "auto" or mode == "plain" or mode == "roblox", "--opcodes expects auto, plain or roblox")
             options.opcode_multiplier = mode == "plain" and 1 or (mode == "roblox" and 203 or nil)
+        elseif a == "--force" then overwrite = true
         elseif a == "--no-header" then options.header = false
         elseif a == "--strict-trailing" then options.strict_trailing = true
         elseif a:sub(1, 1) == "-" and a ~= "-" then fail("unknown option " .. a)
@@ -1391,18 +1573,66 @@ function D.main(arguments)
     if not input then usage(); return 2 end
     check(type(io) == "table" and type(io.open) == "function", "this host has no file I/O; use decompile(bytes)")
     check(not output or input == "-" or output ~= input, "input and output paths must differ")
+    check(not input:find("\0", 1, true) and (not output or not output:find("\0", 1, true)), "paths must not contain NUL")
+    options = configure(options)
     local file, message
     if input == "-" then file = io.stdin else file, message = io.open(input, "rb") end
     check(file, "cannot open input: " .. tostring(message))
-    local data = file:read((options.max_bytes or 67108864) + 1)
-    if input ~= "-" then file:close() end
-    check(data, "cannot read input")
+    local data, readerr = file:read(options.max_bytes + 1)
+    local closed, closeerr = true, nil
+    if input ~= "-" then closed, closeerr = file:close() end
+    check(data and not readerr and closed, "cannot read input: " .. tostring(readerr or closeerr))
+    -- Standard Lua has no lstat/O_EXCL. The CLI requires a trusted output
+    -- directory; never treat these checks as a hostile-filesystem sandbox.
+    local function exists(path)
+        local f = io.open(path, "rb")
+        if f then f:close(); return true end
+        check(type(os) == "table" and type(os.rename) == "function", "file output requires os.rename")
+        local ok, err, code = os.rename(path, path)
+        if ok then return true end -- includes dangling symlinks on POSIX
+        check(code == 2, "cannot inspect output path: " .. tostring(err))
+        return false
+    end
+    if output and output ~= "-" and exists(output) then
+        check(overwrite, "output already exists; use --force to overwrite")
+        local existing = io.open(output, "rb")
+        check(existing, "cannot inspect existing output")
+        if existing then
+            if not overwrite then existing:close(); fail("output already exists; use --force to overwrite") end
+            local previous, err = existing:read(options.max_bytes + 1); local ok = existing:close()
+            check(not err and ok, "cannot inspect existing output")
+            check(input == "-" or previous ~= data, "output matches input bytes; refusing possible path alias")
+        end
+    end
     local source, info = D.decompile(data, options)
     if output and output ~= "-" then
-        local out, err = io.open(output, "wb"); check(out, "cannot open output: " .. tostring(err))
-        local ok, writeerr = out:write(source); local closed, closeerr = out:close()
-        check(ok and closed, "cannot write output: " .. tostring(writeerr or closeerr))
-    else io.write(source) end
+        check(type(os) == "table" and type(os.tmpname) == "function" and type(os.remove) == "function", "file output requires os.tmpname/os.remove")
+        -- Stage beside the destination so rename stays on the same filesystem.
+        -- Do not truncate the previous output until generation and writes succeed.
+        local seed = os.tmpname()
+        local suffix = seed:match("([^/\\]+)$")
+        check(suffix and suffix:match("^[A-Za-z0-9_.-]+$"), "unsafe temporary file name")
+        local temporary = (output:match("^(.*[/\\])") or "") .. ".luau-decompiler-" .. suffix
+        local removed, removeerr, removecode = os.remove(seed)
+        check(removed or removecode == 2, "cannot release temporary name: " .. tostring(removeerr))
+        check(temporary ~= output and not exists(temporary), "temporary output already exists")
+        local out, err = io.open(temporary, "wb"); check(out, "cannot open temporary output: " .. tostring(err))
+        local ok, writeerr = out:write(source)
+        local flushed, flusherr = out:flush()
+        local closed, closeerr = out:close()
+        if not (ok and flushed and closed) then
+            os.remove(temporary); fail("cannot write output: " .. tostring(writeerr or flusherr or closeerr))
+        end
+        local inspected, present = pcall(exists, output)
+        if not inspected or (present and not overwrite) then
+            os.remove(temporary); fail(inspected and "output appeared during write; refusing overwrite" or present)
+        end
+        local renamed, renameerr = os.rename(temporary, output)
+        if not renamed then os.remove(temporary); fail("cannot replace output: " .. tostring(renameerr)) end
+    else
+        local ok, err = io.stdout:write(source); check(ok, "cannot write stdout: " .. tostring(err))
+        local flushed, flusherr = io.stdout:flush(); check(flushed, "cannot flush stdout: " .. tostring(flusherr))
+    end
     for _, warning in ipairs(info.warnings) do io.stderr:write("warning: ", warning, "\n") end
     return 0
 end

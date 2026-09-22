@@ -24,7 +24,7 @@ SOFTWARE.
 
 -- Luau bytecode decompiler. Runtime syntax: Lua 5.1; output syntax: Luau.
 -- MIT License. No native modules, bit library, string.unpack or input execution.
-local D = { version = "0.1.3" }
+local D = { version = "0.1.4" }
 local floor, concat, insert = math.floor, table.concat, table.insert
 local function fail(message)
     -- Bytecode error chunks and file names are untrusted diagnostic text.
@@ -40,25 +40,21 @@ local function copy(t) local o = {}; for k, v in pairs(t) do o[k] = v end; retur
 local function set(words) local t = {}; for w in words:gmatch("%S+") do t[w] = true end; return t end
 local keywords = set("and break do else elseif end false for function if in local nil not or repeat return then true until while continue type export")
 local function identifier(s) return type(s) == "string" and s:match("^[A-Za-z_][A-Za-z0-9_]*$") and not keywords[s] end
--- Limits are request-local, finite integers. No debug hooks or global budgets.
-local limits = {
-    max_bytes = { 16777216, 67108864 }, max_strings = { 100000, 1000000 },
-    max_string_bytes = { 1048576, 16777216 }, max_protos = { 10000, 100000 },
-    max_instructions = { 250000, 4000000 }, max_constants = { 100000, 1000000 },
-    max_table_entries = { 200000, 1000000 }, max_debug_entries = { 200000, 1000000 },
-    max_nodes = { 250000, 1000000 }, max_work = { 50000000, 500000000 },
-    max_depth = { 64, 128 }, max_expression_depth = { 128, 256 },
-    max_function_expansions = { 10000, 100000 }, max_output_bytes = { 16777216, 67108864 },
-    max_scope_locals = { 180, 200 }
-}
+-- Resource ceilings are opt-in. Nil/false/math.huge means unlimited.
+-- This does not disable bytecode format checks or the host VM's own limits.
+local resourceLimits = set("max_bytes max_strings max_string_bytes max_protos max_instructions max_constants max_table_entries max_debug_entries max_nodes max_work max_depth max_expression_depth max_function_expansions max_output_bytes")
 local function configure(options)
     check(options == nil or type(options) == "table", "options must be a table")
     local o = copy(options or {})
-    for name, bounds in pairs(limits) do
-        local n = o[name]; if n == nil then n = bounds[1] end
-        check(type(n) == "number" and n >= 1 and n <= bounds[2] and n == floor(n), name .. " must be a finite positive integer <= " .. bounds[2])
+    for name in pairs(resourceLimits) do
+        local n = o[name]
+        if n == nil or n == false then n = math.huge end
+        check(type(n) == "number" and n >= 1 and n == floor(n), name .. " must be a positive integer or false (unlimited)")
         o[name] = n
     end
+    -- Lexical scope splitting is required by the source compiler, not an input cap.
+    o.max_scope_locals = o.max_scope_locals or 180
+    check(type(o.max_scope_locals) == "number" and o.max_scope_locals >= 1 and o.max_scope_locals <= 200 and o.max_scope_locals == floor(o.max_scope_locals), "max_scope_locals must be an integer in 1..200")
     for _, name in ipairs({ "header", "expression_if", "strict_trailing", "allow_trailing" }) do
         check(o[name] == nil or type(o[name]) == "boolean", name .. " must be boolean")
     end
@@ -90,6 +86,7 @@ local function configure(options)
         o.upvalue_names = names
     end
     o._budget = { work = 0, nodes = 0, constants = 0, entries = 0, debug = 0 }
+    o._quoted = {}
     return o
 end
 local function spend(options, amount)
@@ -112,21 +109,23 @@ local function join(options, parts, separator)
     return concat(parts, separator)
 end
 local function quote(s, options)
-    if options then
-        local size = 2
-        for i = 1, #s do
-            local n = s:byte(i)
-            size = size + ((n == 9 or n == 10 or n == 13 or n == 34 or n == 92) and 2 or ((n < 32 or n >= 127) and 4 or 1))
-        end
-        check(size <= options.max_output_bytes, "string literal exceeds output limit")
-        spend(options, #s)
-    end
-    return '"' .. s:gsub('[%z\1-\31\127-\255\\"]', function(c)
+    local cached = options and options._quoted[s]
+    if cached then return cached end
+    -- Native scanning/escaping avoids a second Lua-level per-byte pass and
+    -- memoization avoids re-escaping a large constant at every reference.
+    local escaped = s:gsub('[%z\1-\31\127-\255\\"]', function(c)
         local n = c:byte()
         if n == 10 then return "\\n" elseif n == 13 then return "\\r" elseif n == 9 then return "\\t"
         elseif c == '"' then return '\\"' elseif c == '\\' then return '\\\\' end
         return string.format("\\%03d", n)
-    end) .. '"'
+    end)
+    if options then
+        check(#escaped + 2 <= options.max_output_bytes, "string literal exceeds output limit")
+        spend(options, #s)
+    end
+    local text = '"' .. escaped .. '"'
+    if options then options._quoted[s] = text end
+    return text
 end
 local function number(n)
     if n ~= n then return "(0 / 0)" end
@@ -483,7 +482,7 @@ local function ir(chunk, p, options)
     end
     for r = 0, p.params - 1 do local v = value(r, -1, g.entry, "param"); v.parameter = r + 1; ctx.params[r + 1] = v; g.entry.input[r] = v end
     local function constant(k, depth)
-        depth = (depth or 0) + 1; check(depth <= math.min(100, options.max_expression_depth), "constant nesting too deep"); nodes(options)
+        depth = (depth or 0) + 1; check(depth <= options.max_expression_depth, "constant nesting too deep"); nodes(options)
         local c = p.constants[k]; check(c, "constant index " .. tostring(k) .. " is out of range in prototype " .. p.id)
         if c.tag == 0 then return literal("nil") elseif c.tag == 1 then return literal(tostring(c.value))
         elseif c.tag == 2 then return literal(number(c.value)) elseif c.tag == 3 then local e = literal(quote(c.value, options)); e.string = c.value; return e
@@ -1298,7 +1297,7 @@ local function planLocals(ctx)
     -- declarations in one lexical scope exceed the compiler's local limit.
     -- Split oversized regions into do/end scopes. The LCA calculation hoists
     -- only bindings genuinely shared across both regions; captures stay lexical.
-    for iteration = 1, 64 do
+    for iteration = 1, #ctx.values + 1 do
         scopes, bindings = {}, {}
         traverse(ctx.ast)
         for v, block in pairs(scopes) do
@@ -1319,7 +1318,7 @@ local function planLocals(ctx)
         end
         inspect(ctx.ast, #ctx.params)
         if not candidate then break end
-        check(iteration < 64, "cannot safely reduce lexical local count")
+        check(iteration <= #ctx.values, "cannot safely reduce lexical local count")
         local middle = floor(#candidate.body / 2); local left, right = {}, {}
         for i, st in ipairs(candidate.body) do
             local side = i <= middle and left or right; side[#side + 1] = st
@@ -1579,7 +1578,7 @@ function D.main(arguments)
     local file, message
     if input == "-" then file = io.stdin else file, message = io.open(input, "rb") end
     check(file, "cannot open input: " .. tostring(message))
-    local data, readerr = file:read(options.max_bytes + 1)
+    local data, readerr = file:read(options.max_bytes == math.huge and "*a" or options.max_bytes + 1)
     local closed, closeerr = true, nil
     if input ~= "-" then closed, closeerr = file:close() end
     check(data and not readerr and closed, "cannot read input: " .. tostring(readerr or closeerr))
@@ -1600,7 +1599,7 @@ function D.main(arguments)
         check(existing, "cannot inspect existing output")
         if existing then
             if not overwrite then existing:close(); fail("output already exists; use --force to overwrite") end
-            local previous, err = existing:read(options.max_bytes + 1); local ok = existing:close()
+            local previous, err = existing:read(options.max_bytes == math.huge and "*a" or options.max_bytes + 1); local ok = existing:close()
             check(not err and ok, "cannot inspect existing output")
             check(input == "-" or previous ~= data, "output matches input bytes; refusing possible path alias")
         end

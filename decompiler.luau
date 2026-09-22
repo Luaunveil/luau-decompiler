@@ -24,7 +24,7 @@ SOFTWARE.
 
 -- Luau bytecode decompiler. Runtime syntax: Lua 5.1; output syntax: Luau.
 -- MIT License. No native modules, bit library, string.unpack or input execution.
-local D = { version = "0.1.3" }
+local D = { version = "0.1.4" }
 local floor, concat, insert = math.floor, table.concat, table.insert
 local function fail(message)
     -- Bytecode error chunks and file names are untrusted diagnostic text.
@@ -40,25 +40,21 @@ local function copy(t) local o = {}; for k, v in pairs(t) do o[k] = v end; retur
 local function set(words) local t = {}; for w in words:gmatch("%S+") do t[w] = true end; return t end
 local keywords = set("and break do else elseif end false for function if in local nil not or repeat return then true until while continue type export")
 local function identifier(s) return type(s) == "string" and s:match("^[A-Za-z_][A-Za-z0-9_]*$") and not keywords[s] end
--- Limits are request-local, finite integers. No debug hooks or global budgets.
-local limits = {
-    max_bytes = { 16777216, 67108864 }, max_strings = { 100000, 1000000 },
-    max_string_bytes = { 1048576, 16777216 }, max_protos = { 10000, 100000 },
-    max_instructions = { 250000, 4000000 }, max_constants = { 100000, 1000000 },
-    max_table_entries = { 200000, 1000000 }, max_debug_entries = { 200000, 1000000 },
-    max_nodes = { 250000, 1000000 }, max_work = { 50000000, 500000000 },
-    max_depth = { 64, 128 }, max_expression_depth = { 128, 256 },
-    max_function_expansions = { 10000, 100000 }, max_output_bytes = { 16777216, 67108864 },
-    max_scope_locals = { 180, 200 }
-}
+-- Resource ceilings are opt-in. Nil/false/math.huge means unlimited.
+-- This does not disable bytecode format checks or the host VM's own limits.
+local resourceLimits = set("max_bytes max_strings max_string_bytes max_protos max_instructions max_constants max_table_entries max_debug_entries max_nodes max_work max_depth max_expression_depth max_function_expansions max_output_bytes")
 local function configure(options)
     check(options == nil or type(options) == "table", "options must be a table")
     local o = copy(options or {})
-    for name, bounds in pairs(limits) do
-        local n = o[name]; if n == nil then n = bounds[1] end
-        check(type(n) == "number" and n >= 1 and n <= bounds[2] and n == floor(n), name .. " must be a finite positive integer <= " .. bounds[2])
+    for name in pairs(resourceLimits) do
+        local n = o[name]
+        if n == nil or n == false then n = math.huge end
+        check(type(n) == "number" and n >= 1 and n == floor(n), name .. " must be a positive integer or false (unlimited)")
         o[name] = n
     end
+    -- Lexical scope splitting is required by the source compiler, not an input cap.
+    o.max_scope_locals = o.max_scope_locals or 180
+    check(type(o.max_scope_locals) == "number" and o.max_scope_locals >= 1 and o.max_scope_locals <= 200 and o.max_scope_locals == floor(o.max_scope_locals), "max_scope_locals must be an integer in 1..200")
     for _, name in ipairs({ "header", "expression_if", "strict_trailing", "allow_trailing" }) do
         check(o[name] == nil or type(o[name]) == "boolean", name .. " must be boolean")
     end
@@ -90,6 +86,7 @@ local function configure(options)
         o.upvalue_names = names
     end
     o._budget = { work = 0, nodes = 0, constants = 0, entries = 0, debug = 0 }
+    o._quoted = {}
     return o
 end
 local function spend(options, amount)
@@ -112,21 +109,23 @@ local function join(options, parts, separator)
     return concat(parts, separator)
 end
 local function quote(s, options)
-    if options then
-        local size = 2
-        for i = 1, #s do
-            local n = s:byte(i)
-            size = size + ((n == 9 or n == 10 or n == 13 or n == 34 or n == 92) and 2 or ((n < 32 or n >= 127) and 4 or 1))
-        end
-        check(size <= options.max_output_bytes, "string literal exceeds output limit")
-        spend(options, #s)
-    end
-    return '"' .. s:gsub('[%z\1-\31\127-\255\\"]', function(c)
+    local cached = options and options._quoted[s]
+    if cached then return cached end
+    -- Native scanning/escaping avoids a second Lua-level per-byte pass and
+    -- memoization avoids re-escaping a large constant at every reference.
+    local escaped = s:gsub('[%z\1-\31\127-\255\\"]', function(c)
         local n = c:byte()
         if n == 10 then return "\\n" elseif n == 13 then return "\\r" elseif n == 9 then return "\\t"
         elseif c == '"' then return '\\"' elseif c == '\\' then return '\\\\' end
         return string.format("\\%03d", n)
-    end) .. '"'
+    end)
+    if options then
+        check(#escaped + 2 <= options.max_output_bytes, "string literal exceeds output limit")
+        spend(options, #s)
+    end
+    local text = '"' .. escaped .. '"'
+    if options then options._quoted[s] = text end
+    return text
 end
 local function number(n)
     if n ~= n then return "(0 / 0)" end
@@ -483,7 +482,7 @@ local function ir(chunk, p, options)
     end
     for r = 0, p.params - 1 do local v = value(r, -1, g.entry, "param"); v.parameter = r + 1; ctx.params[r + 1] = v; g.entry.input[r] = v end
     local function constant(k, depth)
-        depth = (depth or 0) + 1; check(depth <= math.min(100, options.max_expression_depth), "constant nesting too deep"); nodes(options)
+        depth = (depth or 0) + 1; check(depth <= options.max_expression_depth, "constant nesting too deep"); nodes(options)
         local c = p.constants[k]; check(c, "constant index " .. tostring(k) .. " is out of range in prototype " .. p.id)
         if c.tag == 0 then return literal("nil") elseif c.tag == 1 then return literal(tostring(c.value))
         elseif c.tag == 2 then return literal(number(c.value)) elseif c.tag == 3 then local e = literal(quote(c.value, options)); e.string = c.value; return e
@@ -1298,7 +1297,7 @@ local function planLocals(ctx)
     -- declarations in one lexical scope exceed the compiler's local limit.
     -- Split oversized regions into do/end scopes. The LCA calculation hoists
     -- only bindings genuinely shared across both regions; captures stay lexical.
-    for iteration = 1, 64 do
+    for iteration = 1, #ctx.values + 1 do
         scopes, bindings = {}, {}
         traverse(ctx.ast)
         for v, block in pairs(scopes) do
@@ -1319,7 +1318,7 @@ local function planLocals(ctx)
         end
         inspect(ctx.ast, #ctx.params)
         if not candidate then break end
-        check(iteration < 64, "cannot safely reduce lexical local count")
+        check(iteration <= #ctx.values, "cannot safely reduce lexical local count")
         local middle = floor(#candidate.body / 2); local left, right = {}, {}
         for i, st in ipairs(candidate.body) do
             local side = i <= middle and left or right; side[#side + 1] = st
@@ -1540,9 +1539,9 @@ function D.decompile(data, options)
     return source, { version = chunk.version, type_version = chunk.types, prototypes = #chunk.protos, instruction_words = chunk.instruction_words, opcode_multiplier = chunk.opcode_multiplier, trailing_bytes = #chunk.trailing, warnings = chunk.warnings, decompiler_version = D.version, work_units = options._budget.work, intermediate_nodes = options._budget.nodes }
 end
 
--- Luau host adapter. The decompiler core above is identical in both entries.
--- Host APIs follow the supplied Synapse X documentation: readfile, writefile,
--- isfile and setclipboard. No dependency on a host-provided decompile function.
+
+-- Luau instance adapter. Bytecode extraction is supplied by the host, while
+-- decompilation is performed entirely by the common core above.
 D.runtime = "Luau"
 
 local function sharedEnvironment()
@@ -1551,121 +1550,154 @@ local function sharedEnvironment()
     check(ok and type(env) == "table", "getgenv must return an environment table")
     return env
 end
-local function workspacePath(path, label)
-    check(type(path) == "string" and #path > 0 and #path <= 1024, label .. " must be a nonempty workspace-relative path (max 1024 bytes)")
-    check(not path:find("[%z\1-\31\127]"), label .. " contains control characters")
-    path = path:gsub("\\", "/")
-    check(path:sub(1, 1) ~= "/" and not path:find(":", 1, true), label .. " must stay inside the workspace")
-    check(path:sub(-1) ~= "/", label .. " must name a file")
-    local parts = {}
-    for part in path:gmatch("[^/]+") do
-        check(part ~= "..", label .. " must not contain parent traversal")
-        if part ~= "." then
-            check(not part:find('[<>"|?*]') and not part:match("[. ]$"), label .. " contains an unsafe path component")
-            local device = part:match("^([^.]*)"):lower()
-            check(device ~= "con" and device ~= "prn" and device ~= "aux" and device ~= "nul" and not device:match("^com[1-9]$") and not device:match("^lpt[1-9]$"), label .. " names a reserved device")
-            parts[#parts + 1] = part
-        end
-    end
-    check(#parts > 0, label .. " must name a file")
-    return concat(parts, "/")
-end
 local function hostCall(fn, label, ...)
     check(type(fn) == "function", "host does not provide " .. label)
     local ok, result = pcall(fn, ...)
     check(ok, label .. " failed: " .. tostring(result))
-    check(result ~= false, label .. " reported failure")
     return result
+end
+local function isInstance(value)
+    return type(typeof) == "function" and typeof(value) == "Instance"
+end
+local function pathParts(path)
+    check(type(path) == "string" and not path:find("[%z\1-\31\127]"), "input must be an instance path without control characters")
+    local parts, pos, size = {}, 1, #path
+    local function space()
+        while pos <= size and path:sub(pos, pos):match("%s") do pos = pos + 1 end
+    end
+    local function name()
+        space()
+        local first, last = path:find("[A-Za-z_][A-Za-z0-9_]*", pos)
+        check(first == pos, "expected instance name at path position " .. pos)
+        parts[#parts + 1] = path:sub(first, last); pos = last + 1
+    end
+    name()
+    while true do
+        space(); if pos > size then break end
+        local symbol = path:sub(pos, pos); pos = pos + 1
+        if symbol == "." then name()
+        elseif symbol == "[" then
+            space(); local delimiter = path:sub(pos, pos); pos = pos + 1
+            check(delimiter == '"' or delimiter == "'", "bracket paths require a quoted child name")
+            local chars, closed = {}, false
+            while pos <= size do
+                local c = path:sub(pos, pos); pos = pos + 1
+                if c == delimiter then closed = true; break end
+                if c == "\\" then
+                    c = path:sub(pos, pos); pos = pos + 1
+                    check(c == "\\" or c == '"' or c == "'", "unsupported escape in instance path")
+                end
+                chars[#chars + 1] = c
+            end
+            check(closed, "unterminated quoted child name")
+            space(); check(path:sub(pos, pos) == "]", "expected closing path bracket"); pos = pos + 1
+            parts[#parts + 1] = concat(chars)
+        else fail("instance paths accept only names, dots and quoted brackets; not executable expressions") end
+    end
+    return parts
+end
+function D.resolve(target)
+    if isInstance(target) then return target end
+    local parts = pathParts(target)
+    check(isInstance(game), "host does not provide Roblox game")
+    local current, first = game, 1
+    if parts[1] == "game" or parts[1] == "Game" then first = 2 end
+    for j = first, #parts do
+        local name = parts[j]
+        if current == game and (name == "workspace" or name == "Workspace") then
+            current = hostCall(game.GetService, "GetService", game, "Workspace")
+        else
+            current = hostCall(current.FindFirstChild, "FindFirstChild", current, name)
+        end
+        check(isInstance(current), "instance path component not found: " .. quote(name))
+    end
+    return current
+end
+local function scriptName(target)
+    local name = target.Name
+    check(type(name) == "string", "script has no string Name")
+    -- Keep actual names, including Unicode; replace filename separators and
+    -- device-unsafe characters only. Never use the full instance path as a file.
+    name = name:gsub('[%z\1-\31\127/\\:<>"|?*]', "_"):gsub("[. ]+$", "_")
+    if name == "" then name = "Script" end
+    local base = name:match("^([^.]*)"):lower()
+    if base == "con" or base == "prn" or base == "aux" or base == "nul" or base:match("^com[1-9]$") or base:match("^lpt[1-9]$") then name = "_" .. name end
+    return name
+end
+local pendingOutputs = {}
+local function reserveOutput(target, exists)
+    check(type(os) == "table" and type(os.date) == "function", "file mode requires os.date")
+    local stamp = hostCall(os.date, "os.date", "%Y%m%d%S")
+    check(type(stamp) == "string" and stamp:match("^%d%d%d%d%d%d%d%d%d%d$"), "os.date returned an invalid yyyymmddss timestamp")
+    local prefix, number = scriptName(target) .. stamp, 1
+    while true do
+        local path = prefix .. string.format("%.0f", number) .. ".lua"
+        if not pendingOutputs[path] then
+            pendingOutputs[path] = true
+            local ok, present = pcall(exists, path)
+            if not ok then pendingOutputs[path] = nil; error(present, 0) end
+            if not present then return path end
+            pendingOutputs[path] = nil
+        end
+        local nextNumber = number + 1
+        check(nextNumber > number, "host number representation exhausted filename suffixes")
+        number = nextNumber
+    end
 end
 function D.run(config)
     check(type(config) == "table", "run expects a configuration table")
-    local inputPath = workspacePath(config.input, "input")
     local mode = config.saveMode
     if mode == nil then mode = "cl" end
     check(mode == "cl" or mode == "file", "saveMode must be 'cl' or 'file'")
-    check(config.overwrite == nil or type(config.overwrite) == "boolean", "overwrite must be boolean")
     check(config.quiet == nil or type(config.quiet) == "boolean", "quiet must be boolean")
-    local options = configure(config.options)
-    -- Only source text is emitted; this constructor is not called here.
-    if options.vector_constructor == nil and type(Vector3) == "table" and type(Vector3.new) == "function" then
-        options.vector_constructor = "Vector3.new"
-    end
-    local env = sharedEnvironment()
+    check(config.output == nil and config.overwrite == nil, "file names are generated automatically; output/overwrite are no longer supported")
+    local options, env = configure(config.options), sharedEnvironment()
+    if options.vector_constructor == nil and type(Vector3) == "table" and type(Vector3.new) == "function" then options.vector_constructor = "Vector3.new" end
+    -- getscriptbytecode is a host extension, not part of the provided Synapse
+    -- document or standard Luau. Never fall back to the host's decompile().
+    local extract = getscriptbytecode or rawget(env, "getscriptbytecode")
     local read = readfile or rawget(env, "readfile")
     local write = writefile or rawget(env, "writefile")
     local isFile = isfile or rawget(env, "isfile")
     local clipboard = setclipboard or rawget(env, "setclipboard")
-    check(type(read) == "function", "host does not provide readfile")
-    local outputPath, previous
-    local function exists(path)
-        check(type(isFile) == "function", "host does not provide isfile")
-        local ok, result = pcall(isFile, path)
-        check(ok and type(result) == "boolean", "isfile must return a boolean")
-        return result
-    end
-    if mode == "cl" then
-        check(type(clipboard) == "function", "host does not provide setclipboard")
-    else
-        check(type(write) == "function" and type(isFile) == "function", "file mode requires writefile and isfile")
-        local basename = inputPath:match("([^/]+)$"):gsub("%.[^.]+$", "")
-        outputPath = workspacePath(config.output or (basename .. ".decompiled.luau"), "output")
-        check(outputPath:lower():match("%.luau?$") ~= nil, "output must end in .lua or .luau")
-        check(outputPath:lower() ~= inputPath:lower(), "input and output paths must differ")
-        if exists(outputPath) then
-            check(config.overwrite == true, "output already exists; set overwrite=true to replace it")
-            previous = hostCall(read, "readfile", outputPath)
-            check(type(previous) == "string" and #previous <= options.max_output_bytes, "existing output exceeds backup limit")
-        end
-    end
-    -- readfile has no documented streaming interface: the byte limit can only
-    -- be enforced after the host has returned the complete file contents.
-    local bytes = hostCall(read, "readfile", inputPath)
-    check(type(bytes) == "string", "readfile must return a byte string")
-    check(#bytes <= options.max_bytes, "input exceeds max_bytes")
-    check(previous == nil or previous ~= bytes, "output matches input bytes; refusing possible path alias")
+    check(type(extract) == "function", "host does not provide getscriptbytecode; an instance bytecode extractor is required")
+    if mode == "cl" then check(type(clipboard) == "function", "host does not provide setclipboard")
+    else check(type(write) == "function" and type(read) == "function" and type(isFile) == "function", "file mode requires writefile, readfile and isfile") end
+    local target = D.resolve(config.input)
+    check(hostCall(target.IsA, "IsA", target, "LocalScript") or hostCall(target.IsA, "IsA", target, "ModuleScript") or hostCall(target.IsA, "IsA", target, "Script"), "input must resolve to a script instance")
+    local bytes = hostCall(extract, "getscriptbytecode", target)
+    check(type(bytes) == "string" and #bytes > 0, "getscriptbytecode returned no bytecode")
     local source, info = D.decompile(bytes, options)
     if mode == "cl" then
-        hostCall(clipboard, "setclipboard", source)
-        info.saved_to = "clipboard"
+        check(hostCall(clipboard, "setclipboard", source) ~= false, "setclipboard reported failure"); info.saved_to = "clipboard"
     else
-        -- Recheck just before writing. This is not an atomic no-replace or
-        -- symlink check; only use a workspace controlled by the caller.
-        if previous == nil then
-            check(not exists(outputPath), "output appeared during decompilation; refusing overwrite")
-        else
-            check(hostCall(read, "readfile", outputPath) == previous, "output changed during decompilation; refusing overwrite")
+        local function exists(path)
+            local result = hostCall(isFile, "isfile", path)
+            check(type(result) == "boolean", "isfile must return a boolean")
+            return result
         end
+        -- No rename/O_EXCL is available in the documented host interface. Use a
+        -- caller-controlled workspace; checking isfile cannot close an external race.
+        local outputPath = reserveOutput(target, exists)
         local ok, err = pcall(function()
-            hostCall(write, "writefile", outputPath, source)
+            check(not exists(outputPath), "output appeared before write; refusing overwrite")
+            check(hostCall(write, "writefile", outputPath, source) ~= false, "writefile reported failure")
             check(hostCall(read, "readfile", outputPath) == source, "output verification failed")
         end)
-        if not ok then
-            -- The documented API has no rename primitive. An explicit overwrite
-            -- gets best-effort restoration, with verification; never claim atomicity.
-            local restored = false
-            if previous ~= nil then
-                local recovered = pcall(function()
-                    hostCall(write, "writefile", outputPath, previous)
-                    check(hostCall(read, "readfile", outputPath) == previous, "restore verification failed")
-                end)
-                restored = recovered
-            end
-            fail(tostring(err) .. (restored and "; previous output restored" or "; output may be partial; inspect the destination"))
-        end
+        pendingOutputs[outputPath] = nil
+        check(ok, tostring(err) .. "; inspect the new destination for a partial output")
         info.saved_to = outputPath
     end
     if not config.quiet then
         local notify = type(warn) == "function" and warn or print
         if type(notify) == "function" then
-            notify("luau-decompiler: " .. (mode == "cl" and "copied to clipboard" or ("saved to " .. quote(outputPath))))
+            notify("luau-decompiler: " .. (mode == "cl" and "copied to clipboard" or ("saved to " .. quote(info.saved_to))))
             for _, warning in ipairs(info.warnings) do notify("luau-decompiler: " .. warning) end
         end
     end
     return source, info
 end
 
--- loadstring(source)("module") disables autorun, even when a shared input exists.
--- With no configured input this also behaves as a normal require-able module.
 local entryMode = ...
 if entryMode ~= "module" then
     local env = sharedEnvironment()
@@ -1675,13 +1707,7 @@ if entryMode ~= "module" then
     end
     local configuredInput = setting(input, "input")
     if configuredInput ~= nil then
-        local _, info = D.run({
-            input = configuredInput,
-            saveMode = setting(saveMode, "saveMode"),
-            output = setting(outputPath, "outputPath"),
-            overwrite = setting(overwriteOutput, "overwriteOutput"),
-            options = setting(decompilerOptions, "decompilerOptions"),
-        })
+        local _, info = D.run({ input = configuredInput, saveMode = setting(saveMode, "saveMode"), options = setting(decompilerOptions, "decompilerOptions") })
         D.lastInfo = info
     end
 end

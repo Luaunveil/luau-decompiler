@@ -50,7 +50,7 @@ lua5.1 decompiler.lua input.luac -o output.luau
 ### Luau
 
 ```lua
-input = [==[Workspace.LocalScript]==]
+input = [==[ 在这里填写输入脚本路径 ]==]
 -- 默认复制到剪贴板；file 保存到执行器工作区
 saveMode = "cl" -- cl 或 file
 

@@ -1540,116 +1540,149 @@ function D.decompile(data, options)
     return source, { version = chunk.version, type_version = chunk.types, prototypes = #chunk.protos, instruction_words = chunk.instruction_words, opcode_multiplier = chunk.opcode_multiplier, trailing_bytes = #chunk.trailing, warnings = chunk.warnings, decompiler_version = D.version, work_units = options._budget.work, intermediate_nodes = options._budget.nodes }
 end
 
+-- Luau host adapter. The decompiler core above is identical in both entries.
+-- Host APIs follow the supplied Synapse X documentation: readfile, writefile,
+-- isfile and setclipboard. No dependency on a host-provided decompile function.
+D.runtime = "Luau"
 
--- Lua 5.1 entry point. Luau hosts use decompiler.luau.
-D.runtime = "Lua 5.1"
-
--- File I/O belongs to this optional command-line adapter. The core module does
--- not require io, os, package, loadstring, debug or any host bytecode executor.
-function D.main(arguments)
-    local input, output, options, overwrite = nil, nil, {}, false
-    local function usage()
-        print("Usage: lua5.1 decompiler.lua INPUT [-o OUTPUT] [--opcodes auto|plain|roblox] [--no-header] [--strict-trailing] [--force]")
-        print("INPUT/OUTPUT may be '-' for stdin/stdout. Luau hosts: use decompiler.luau.")
+local function sharedEnvironment()
+    if type(getgenv) ~= "function" then return {} end
+    local ok, env = pcall(getgenv)
+    check(ok and type(env) == "table", "getgenv must return an environment table")
+    return env
+end
+local function workspacePath(path, label)
+    check(type(path) == "string" and #path > 0 and #path <= 1024, label .. " must be a nonempty workspace-relative path (max 1024 bytes)")
+    check(not path:find("[%z\1-\31\127]"), label .. " contains control characters")
+    path = path:gsub("\\", "/")
+    check(path:sub(1, 1) ~= "/" and not path:find(":", 1, true), label .. " must stay inside the workspace")
+    check(path:sub(-1) ~= "/", label .. " must name a file")
+    local parts = {}
+    for part in path:gmatch("[^/]+") do
+        check(part ~= "..", label .. " must not contain parent traversal")
+        if part ~= "." then
+            check(not part:find('[<>"|?*]') and not part:match("[. ]$"), label .. " contains an unsafe path component")
+            local device = part:match("^([^.]*)"):lower()
+            check(device ~= "con" and device ~= "prn" and device ~= "aux" and device ~= "nul" and not device:match("^com[1-9]$") and not device:match("^lpt[1-9]$"), label .. " names a reserved device")
+            parts[#parts + 1] = part
+        end
     end
-    local index = 1
-    while index <= #arguments do
-        local a = arguments[index]
-        if a == "--help" or a == "-h" then usage(); return 0
-        elseif a == "--version" then print(D.version); return 0
-        elseif a == "-o" or a == "--output" then
-            index = index + 1; output = arguments[index]; check(output, "missing output path")
-        elseif a == "--opcodes" then
-            index = index + 1; local mode = arguments[index]
-            check(mode == "auto" or mode == "plain" or mode == "roblox", "--opcodes expects auto, plain or roblox")
-            options.opcode_multiplier = mode == "plain" and 1 or (mode == "roblox" and 203 or nil)
-        elseif a == "--force" then overwrite = true
-        elseif a == "--no-header" then options.header = false
-        elseif a == "--strict-trailing" then options.strict_trailing = true
-        elseif a:sub(1, 1) == "-" and a ~= "-" then fail("unknown option " .. a)
-        elseif not input then input = a
-        else fail("multiple input paths; only one input is supported") end
-        index = index + 1
+    check(#parts > 0, label .. " must name a file")
+    return concat(parts, "/")
+end
+local function hostCall(fn, label, ...)
+    check(type(fn) == "function", "host does not provide " .. label)
+    local ok, result = pcall(fn, ...)
+    check(ok, label .. " failed: " .. tostring(result))
+    check(result ~= false, label .. " reported failure")
+    return result
+end
+function D.run(config)
+    check(type(config) == "table", "run expects a configuration table")
+    local inputPath = workspacePath(config.input, "input")
+    local mode = config.saveMode
+    if mode == nil then mode = "cl" end
+    check(mode == "cl" or mode == "file", "saveMode must be 'cl' or 'file'")
+    check(config.overwrite == nil or type(config.overwrite) == "boolean", "overwrite must be boolean")
+    check(config.quiet == nil or type(config.quiet) == "boolean", "quiet must be boolean")
+    local options = configure(config.options)
+    -- Only source text is emitted; this constructor is not called here.
+    if options.vector_constructor == nil and type(Vector3) == "table" and type(Vector3.new) == "function" then
+        options.vector_constructor = "Vector3.new"
     end
-    if not input then usage(); return 2 end
-    check(type(io) == "table" and type(io.open) == "function", "this host has no file I/O; use decompile(bytes)")
-    check(not output or input == "-" or output ~= input, "input and output paths must differ")
-    check(not input:find("\0", 1, true) and (not output or not output:find("\0", 1, true)), "paths must not contain NUL")
-    options = configure(options)
-    local file, message
-    if input == "-" then file = io.stdin else file, message = io.open(input, "rb") end
-    check(file, "cannot open input: " .. tostring(message))
-    local data, readerr = file:read(options.max_bytes + 1)
-    local closed, closeerr = true, nil
-    if input ~= "-" then closed, closeerr = file:close() end
-    check(data and not readerr and closed, "cannot read input: " .. tostring(readerr or closeerr))
-    -- Standard Lua has no lstat/O_EXCL. The CLI requires a trusted output
-    -- directory; never treat these checks as a hostile-filesystem sandbox.
+    local env = sharedEnvironment()
+    local read = readfile or rawget(env, "readfile")
+    local write = writefile or rawget(env, "writefile")
+    local isFile = isfile or rawget(env, "isfile")
+    local clipboard = setclipboard or rawget(env, "setclipboard")
+    check(type(read) == "function", "host does not provide readfile")
+    local outputPath, previous
     local function exists(path)
-        local f = io.open(path, "rb")
-        if f then f:close(); return true end
-        check(type(os) == "table" and type(os.rename) == "function", "file output requires os.rename")
-        local ok, err, code = os.rename(path, path)
-        if ok then return true end -- includes dangling symlinks on POSIX
-        check(code == 2, "cannot inspect output path: " .. tostring(err))
-        return false
+        check(type(isFile) == "function", "host does not provide isfile")
+        local ok, result = pcall(isFile, path)
+        check(ok and type(result) == "boolean", "isfile must return a boolean")
+        return result
     end
-    if output and output ~= "-" and exists(output) then
-        check(overwrite, "output already exists; use --force to overwrite")
-        local existing = io.open(output, "rb")
-        check(existing, "cannot inspect existing output")
-        if existing then
-            if not overwrite then existing:close(); fail("output already exists; use --force to overwrite") end
-            local previous, err = existing:read(options.max_bytes + 1); local ok = existing:close()
-            check(not err and ok, "cannot inspect existing output")
-            check(input == "-" or previous ~= data, "output matches input bytes; refusing possible path alias")
-        end
-    end
-    local source, info = D.decompile(data, options)
-    if output and output ~= "-" then
-        check(type(os) == "table" and type(os.tmpname) == "function" and type(os.remove) == "function", "file output requires os.tmpname/os.remove")
-        -- Stage beside the destination so rename stays on the same filesystem.
-        -- Do not truncate the previous output until generation and writes succeed.
-        local seed = os.tmpname()
-        local suffix = seed:match("([^/\\]+)$")
-        check(suffix and suffix:match("^[A-Za-z0-9_.-]+$"), "unsafe temporary file name")
-        local temporary = (output:match("^(.*[/\\])") or "") .. ".luau-decompiler-" .. suffix
-        local removed, removeerr, removecode = os.remove(seed)
-        check(removed or removecode == 2, "cannot release temporary name: " .. tostring(removeerr))
-        check(temporary ~= output and not exists(temporary), "temporary output already exists")
-        local out, err = io.open(temporary, "wb"); check(out, "cannot open temporary output: " .. tostring(err))
-        local ok, writeerr = out:write(source)
-        local flushed, flusherr = out:flush()
-        local closed, closeerr = out:close()
-        if not (ok and flushed and closed) then
-            os.remove(temporary); fail("cannot write output: " .. tostring(writeerr or flusherr or closeerr))
-        end
-        local inspected, present = pcall(exists, output)
-        if not inspected or (present and not overwrite) then
-            os.remove(temporary); fail(inspected and "output appeared during write; refusing overwrite" or present)
-        end
-        local renamed, renameerr = os.rename(temporary, output)
-        if not renamed then os.remove(temporary); fail("cannot replace output: " .. tostring(renameerr)) end
+    if mode == "cl" then
+        check(type(clipboard) == "function", "host does not provide setclipboard")
     else
-        local ok, err = io.stdout:write(source); check(ok, "cannot write stdout: " .. tostring(err))
-        local flushed, flusherr = io.stdout:flush(); check(flushed, "cannot flush stdout: " .. tostring(flusherr))
+        check(type(write) == "function" and type(isFile) == "function", "file mode requires writefile and isfile")
+        local basename = inputPath:match("([^/]+)$"):gsub("%.[^.]+$", "")
+        outputPath = workspacePath(config.output or (basename .. ".decompiled.luau"), "output")
+        check(outputPath:lower():match("%.luau?$") ~= nil, "output must end in .lua or .luau")
+        check(outputPath:lower() ~= inputPath:lower(), "input and output paths must differ")
+        if exists(outputPath) then
+            check(config.overwrite == true, "output already exists; set overwrite=true to replace it")
+            previous = hostCall(read, "readfile", outputPath)
+            check(type(previous) == "string" and #previous <= options.max_output_bytes, "existing output exceeds backup limit")
+        end
     end
-    for _, warning in ipairs(info.warnings) do io.stderr:write("warning: ", warning, "\n") end
-    return 0
+    -- readfile has no documented streaming interface: the byte limit can only
+    -- be enforced after the host has returned the complete file contents.
+    local bytes = hostCall(read, "readfile", inputPath)
+    check(type(bytes) == "string", "readfile must return a byte string")
+    check(#bytes <= options.max_bytes, "input exceeds max_bytes")
+    check(previous == nil or previous ~= bytes, "output matches input bytes; refusing possible path alias")
+    local source, info = D.decompile(bytes, options)
+    if mode == "cl" then
+        hostCall(clipboard, "setclipboard", source)
+        info.saved_to = "clipboard"
+    else
+        -- Recheck just before writing. This is not an atomic no-replace or
+        -- symlink check; only use a workspace controlled by the caller.
+        if previous == nil then
+            check(not exists(outputPath), "output appeared during decompilation; refusing overwrite")
+        else
+            check(hostCall(read, "readfile", outputPath) == previous, "output changed during decompilation; refusing overwrite")
+        end
+        local ok, err = pcall(function()
+            hostCall(write, "writefile", outputPath, source)
+            check(hostCall(read, "readfile", outputPath) == source, "output verification failed")
+        end)
+        if not ok then
+            -- The documented API has no rename primitive. An explicit overwrite
+            -- gets best-effort restoration, with verification; never claim atomicity.
+            local restored = false
+            if previous ~= nil then
+                local recovered = pcall(function()
+                    hostCall(write, "writefile", outputPath, previous)
+                    check(hostCall(read, "readfile", outputPath) == previous, "restore verification failed")
+                end)
+                restored = recovered
+            end
+            fail(tostring(err) .. (restored and "; previous output restored" or "; output may be partial; inspect the destination"))
+        end
+        info.saved_to = outputPath
+    end
+    if not config.quiet then
+        local notify = type(warn) == "function" and warn or print
+        if type(notify) == "function" then
+            notify("luau-decompiler: " .. (mode == "cl" and "copied to clipboard" or ("saved to " .. quote(outputPath))))
+            for _, warning in ipairs(info.warnings) do notify("luau-decompiler: " .. warning) end
+        end
+    end
+    return source, info
 end
 
-local runningAsScript = false
-if type(arg) == "table" and type(arg[0]) == "string" and type(io) == "table" then
-    if type(debug) == "table" and type(debug.getinfo) == "function" then
-        local info = debug.getinfo(1, "S")
-        runningAsScript = info and info.source == "@" .. arg[0]
-    else
-        runningAsScript = arg[0]:match("/decompiler%.lua$") ~= nil or arg[0] == "decompiler.lua"
+-- loadstring(source)("module") disables autorun, even when a shared input exists.
+-- With no configured input this also behaves as a normal require-able module.
+local entryMode = ...
+if entryMode ~= "module" then
+    local env = sharedEnvironment()
+    local function setting(value, name)
+        if value ~= nil then return value end
+        return rawget(env, name)
     end
-end
-if runningAsScript then
-    local ok, status = pcall(D.main, arg)
-    if not ok then io.stderr:write(tostring(status), "\n"); status = 1 end
-    if type(os) == "table" and os.exit then os.exit(status) end
+    local configuredInput = setting(input, "input")
+    if configuredInput ~= nil then
+        local _, info = D.run({
+            input = configuredInput,
+            saveMode = setting(saveMode, "saveMode"),
+            output = setting(outputPath, "outputPath"),
+            overwrite = setting(overwriteOutput, "overwriteOutput"),
+            options = setting(decompilerOptions, "decompilerOptions"),
+        })
+        D.lastInfo = info
+    end
 end
 return D

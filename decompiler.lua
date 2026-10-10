@@ -24,7 +24,7 @@ SOFTWARE.
 
 -- Luau bytecode decompiler. Runtime syntax: Lua 5.1; output syntax: Luau.
 -- MIT License. No native modules, bit library, string.unpack or input execution.
-local D = { version = "0.1.4" }
+local D = { version = "0.1.5" }
 local floor, concat, insert = math.floor, table.concat, table.insert
 local function fail(message)
     -- Bytecode error chunks and file names are untrusted diagnostic text.
@@ -191,7 +191,7 @@ local function parse(data, options)
     check(#data <= (options.max_bytes or 67108864), "input exceeds max_bytes")
     local r = reader(data, options); local version = r:u8()
     if version == 0 then fail("compiler error: " .. data:sub(2, 1025)) end
-    check(version >= 3 and version <= 14, "unsupported bytecode version " .. version .. " (expected 3..14)")
+    check((version >= 3 and version <= 14) or version == 100, "unsupported bytecode version " .. version .. " (expected 3..14 or experimental 100)")
     local types = version >= 4 and r:u8() or 0
     check(version < 4 or (types >= 1 and types <= 3), "unsupported type version " .. types)
     local chunk = { version = version, types = types, strings = {}, protos = {}, warnings = {} }
@@ -238,7 +238,31 @@ local function parse(data, options)
             elseif tag == 9 then
                 local sign = r:u8(); check(sign < 2, "invalid integer sign")
                 c.value = (sign == 1 and "-" or "") .. r:uint64text()
-            elseif tag == 10 then fail("Luau class constants are not implemented")
+            elseif tag == 10 then
+                -- Class-shape constants were added in bytecode v10.  The
+                -- loader stores the class name and member names as string
+                -- constants, followed by property/method counts and their
+                -- constant indexes.  Keep the shape instead of rejecting the
+                -- whole chunk; NEWCLASS/NEWCLASSMEMBER can then be rendered
+                -- as ordinary Luau table operations below.
+                local nameIndex = r:varint(); check(nameIndex < k, "forward class name constant")
+                local name = p.constants[nameIndex]; check(name and name.tag == 3, "class name must reference a string constant")
+                local properties, methods = {}, {}
+                local propertyCount = r:count("class property", options.max_table_entries)
+                local methodCount = r:count("class method", options.max_table_entries)
+                check(propertyCount + methodCount <= options.max_table_entries, "class member count exceeds limit")
+                for j = 1, propertyCount do
+                    local index = r:varint(); local member = p.constants[index]
+                    check(index < k and member and member.tag == 3, "class property must reference a string constant")
+                    properties[j] = member.value
+                end
+                for j = 1, methodCount do
+                    local index = r:varint(); local member = p.constants[index]
+                    check(index < k and member and member.tag == 3, "class method must reference a string constant")
+                    methods[j] = member.value
+                end
+                c.value = { name = name.value, properties = properties, methods = methods }
+                chunk.class_constants = (chunk.class_constants or 0) + 1
             else fail("unknown constant tag " .. tag .. " in prototype " .. id) end
             p.constants[k] = c
         end
@@ -287,6 +311,9 @@ local function parse(data, options)
         chunk.warnings[#chunk.warnings + 1] = "Preserved " .. #chunk.trailing .. " opaque trailing bytes; no signature verification was performed."
     end
     chunk.instruction_words = total
+    if chunk.class_constants then
+        chunk.warnings[#chunk.warnings + 1] = "Class shapes were lowered to portable tables; class inheritance/runtime checks are not preserved."
+    end
     return chunk
 end
 function D.parse(data, options) return parse(data, configure(options)) end
@@ -348,7 +375,13 @@ local function validateInstruction(p, i)
         if op == "FASTCALL3" then reg(floor(i.aux / 256) % 256) end
         if op == "FASTCALL2K" then constant(i.aux) end
     elseif op == "FASTPCALL" then check(a <= 1, "invalid FASTPCALL function")
-    elseif op == "NATIVECALL" or op == "CMPPROTO" or op == "NEWCLASS" or op == "NEWCLASSMEMBER" then fail("unsupported " .. op)
+    elseif op == "NEWCLASS" then
+        reg(a); check(b == 255 or b < p.stack, "invalid class superclass register")
+        local shape = constant(i.aux, 10); check(shape.value and shape.value.name, "invalid class shape")
+        check(c <= 1, "invalid class openness flag")
+    elseif op == "NEWCLASSMEMBER" then
+        reg(a); reg(c); constant(i.aux, 3)
+    elseif op == "NATIVECALL" or op == "CMPPROTO" then fail("unsupported " .. op)
     end
 end
 local function decode(chunk, multiplier, options)
@@ -396,8 +429,24 @@ local function decodeChunk(chunk, options)
     local multiplier = options.opcode_multiplier
     if multiplier then check(multiplier >= 1 and multiplier <= 255 and multiplier % 2 == 1, "opcode_multiplier must be odd, 1..255"); decode(chunk, multiplier, options)
     else
-        local ok, err = pcall(decode, chunk, 1, options)
-        if not ok then local encoded, err2 = pcall(decode, chunk, 203, options); if not encoded then fail("neither plain nor encoded opcodes validated:\n" .. tostring(err) .. "\n" .. tostring(err2)) end end
+        -- Auto-detection may try two decoders.  Decode mutates prototype
+        -- instruction caches and consumes the analysis budget, so each trial
+        -- must start from the same state; otherwise a failed plain trial can
+        -- poison the valid encoded trial or exhaust max_work twice.
+        local initialWork = options._budget.work
+        local function trial(candidate)
+            options._budget.work = initialWork
+            for _, p in ipairs(chunk.protos) do p.instructions, p.bypc = nil, nil end
+            return pcall(decode, chunk, candidate, options)
+        end
+        local ok, err = trial(1)
+        if not ok then
+            local encoded, err2 = trial(203)
+            if not encoded then
+                options._budget.work = initialWork
+                fail("neither plain nor encoded opcodes validated:\n" .. tostring(err) .. "\n" .. tostring(err2))
+            end
+        end
     end
     return chunk
 end
@@ -506,6 +555,12 @@ local function ir(chunk, p, options)
         elseif c.tag == 9 then
             check(options.integer_constructor, "integer constant requires options.integer_constructor; refusing double-precision rounding")
             return { tag = "call", fn = { tag = "raw", text = options.integer_constructor }, args = { literal(quote(c.value, options)) }, single = true }
+        elseif c.tag == 10 then
+            -- A class shape is not a normal Lua value.  The portable fallback
+            -- keeps its name observable and lets later class-member writes run.
+            local name = c.value and c.value.name or "Class"
+            local key = literal(quote("__name", options)); key.string = "__name"
+            return { tag = "table", entries = { { key = key, value = literal(quote(name, options)) } } }
         end
         fail("constant kind cannot be used as a literal: " .. c.tag)
     end
@@ -584,6 +639,18 @@ local function ir(chunk, p, options)
                     ctx.closures[#ctx.closures + 1] = e
                 elseif op == "NEWTABLE" then assign(a, { tag = "table", entries = {} }, i)
                 elseif op == "DUPTABLE" then assign(a, constant(i.d), i)
+                elseif op == "NEWCLASS" then
+                    local shape = p.constants[i.aux]; check(shape and shape.tag == 10, "invalid class shape")
+                    -- Luau class syntax is experimental and is not accepted
+                    -- by every target runtime.  Emit a self-contained table
+                    -- with the class name; subsequent NEWCLASSMEMBER writes
+                    -- remain visible and executable in standard Luau.
+                    local classKey = literal(quote("__name", options)); classKey.string = "__name"
+                    local fields = { { key = classKey, value = literal(quote(shape.value.name, options)) } }
+                    assign(a, { tag = "table", entries = fields }, i)
+                elseif op == "NEWCLASSMEMBER" then
+                    local k = p.constants[i.aux]; check(k and k.tag == 3, "invalid class member name")
+                    stmt({ kind = "store", lhs = { tag = "index", base = read(a), key = literal(quote(k.value, options)), field = k.value }, expr = read(c) }, i)
                 elseif op == "SETLIST" then stmt({ kind = "setlist", target = read(a), first = i.aux, args = c == 0 and openargs(bb) or args(bb, c - 1) }, i)
                 elseif binops[op] then assign(a, binary(binops[op], read(bb), read(c)), i)
                 elseif binops[op:sub(1, -2)] and op:sub(-1) == "K" then assign(a, binary(binops[op:sub(1, -2)], read(bb), constant(c)), i)
@@ -1536,7 +1603,7 @@ function D.decompile(data, options)
     end
     if options.header ~= false then source = "-- This file was generated by luaunveil.com ;\n\n" .. source end
     check(#source <= (options.max_output_bytes or 67108864), "output exceeds size limit")
-    return source, { version = chunk.version, type_version = chunk.types, prototypes = #chunk.protos, instruction_words = chunk.instruction_words, opcode_multiplier = chunk.opcode_multiplier, trailing_bytes = #chunk.trailing, warnings = chunk.warnings, decompiler_version = D.version, work_units = options._budget.work, intermediate_nodes = options._budget.nodes }
+    return source, { version = chunk.version, type_version = chunk.types, prototypes = #chunk.protos, instruction_words = chunk.instruction_words, class_constants = chunk.class_constants or 0, opcode_multiplier = chunk.opcode_multiplier, trailing_bytes = #chunk.trailing, warnings = chunk.warnings, decompiler_version = D.version, work_units = options._budget.work, intermediate_nodes = options._budget.nodes }
 end
 
 

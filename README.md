@@ -3,7 +3,7 @@
 <p align="center">Luau Bytecode → 结构化 Luau 源码</p>
 
 <p align="center">
-  <a href="decompiler.lua"><img src="https://img.shields.io/badge/Version-0.1.4-94a3b8?style=flat-square&amp;labelColor=161b22" alt="Version 0.1.4"></a>
+  <a href="decompiler.lua"><img src="https://img.shields.io/badge/Version-0.1.5-94a3b8?style=flat-square&amp;labelColor=161b22" alt="Version 0.1.5"></a>
   <a href="https://www.lua.org/manual/5.1/"><img src="https://img.shields.io/badge/Lua-5.1-818cf8?style=flat-square&amp;logo=lua&amp;logoColor=white&amp;labelColor=161b22" alt="Written in Lua 5.1"></a>
   <a href="https://luau.org/"><img src="https://img.shields.io/badge/Output-Luau-38bdf8?style=flat-square&amp;labelColor=161b22" alt="Output Luau"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-34d399?style=flat-square&amp;labelColor=161b22" alt="License MIT"></a>
@@ -18,7 +18,7 @@
 
 ---
 
-**Lua 5.1 / Luau · 各自单文件 · 无第三方依赖。** 还原控制流、闭包、上值与多返回值，不执行输入字节码。
+**Lua 5.1 / Luau · 各自单文件 · 无第三方依赖。** 还原控制流、闭包、上值与多返回值，不执行输入字节码；支持 Luau 类形状常量，并在非类运行时中降级为可执行表结构。
 
 <a id="quick-start"></a>
 
@@ -103,7 +103,9 @@ local source, info = decompiler.decompile(bytes, {
 
 **默认不设资源上限。** 不再因字符串长度、输入／输出大小、分析工作量或嵌套深度触发内置配额。仅在调用主动提供 `max_*` 数值时启用对应限制；`false` 关闭该项。字节码格式检查仍保留。
 
-`opcode_multiplier` 可指定奇数解码乘数；`upvalue_names` 提供根函数的实际外部上值名；`vector_constructor` / `integer_constructor` 指定宿主构造器，仅接受合格标识符路径。完整配置见 [`decompiler.lua`](decompiler.lua)。
+`opcode_multiplier` 可指定奇数解码乘数；自动识别失败时会回滚第一次尝试的分析缓存和工作量，再尝试 Roblox 编码；`upvalue_names` 提供根函数的实际外部上值名；`vector_constructor` / `integer_constructor` 指定宿主构造器，仅接受合格标识符路径。完整配置见 [`decompiler.lua`](decompiler.lua)。
+
+Luau 类形状会在 `info.warnings` 中报告降级，因为标准 Lua 5.1/Luau 运行时没有统一的类对象 ABI；类名和成员写入会保留在生成源码中，但继承关系与运行时类检查无法恢复。
 
 低层接口：`parse(bytes, options)` 解析容器，`decode(chunk, options)` 解码 `parse` 返回的结果；不要传入不可信的任意 Lua 表。
 

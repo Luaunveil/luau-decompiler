@@ -24,7 +24,7 @@ SOFTWARE.
 
 -- Luau bytecode decompiler. Runtime syntax: Lua 5.1; output syntax: Luau.
 -- MIT License. No native modules, bit library, string.unpack or input execution.
-local D = { version = "0.1.10" }
+local D = { version = "0.1.11" }
 local floor, concat, insert = math.floor, table.concat, table.insert
 local function fail(message)
     -- Bytecode error chunks and file names are untrusted diagnostic text.
@@ -1238,13 +1238,23 @@ local function optimizeIR(ctx)
                                 for j = index + 1, #b.stmts do
                                     local other = b.stmts[j]
                                     if other == target or other.pc >= target.pc then break end
-                                    if not other.removed and not other.synthetic and other.kind ~= "close" then safe = false; break end
+                                    if not other.removed and not other.synthetic and (other.kind ~= "close" or e.tag == "closure") then safe = false; break end
+                                end
+                                -- Anonymous callbacks can cross a method lookup
+                                -- when their value captures cannot change. Reference
+                                -- captures keep the same binding, but may not cross
+                                -- CLOSEUPVALS.
+                                local delayable = e.tag == "closure"
+                                if delayable then
+                                    for _, cap in ipairs(e.captures) do
+                                        if cap.kind == 0 and not stable(cap.expr) then delayable = false; break end
+                                    end
                                 end
                                 local before, found = false, false
                                 statementorder(target, function(x, conditionalDepth, kind)
                                     if x.tag == "ref" and root(x.value) == v then
                                         found = true
-                                        if before or (conditionalDepth > 0 and effect(e, ctx.options)) then safe = false end
+                                        if (before and not delayable) or (conditionalDepth > 0 and effect(e, ctx.options)) then safe = false end
                                     elseif not found and kind == "effect" then before = true end
                                 end, ctx.options)
                                 if e.tag == "closure" and ctx.chunk.protos[e.child + 1].debugname then safe = false end
@@ -1448,6 +1458,27 @@ local function optimizeAST(ctx)
         block.body = compact
     end
     for _ = 1, 3 do visit(ctx.ast) end
+    -- Falling off a function and a zero-result return are equivalent only at
+    -- function tail. In particular, never apply this inside a loop body.
+    local function trimTail(block)
+        local last = block.body[#block.body]
+        if not last then return end
+        if last.kind == "return" and #last.args == 0 then
+            block.body[#block.body] = nil
+            trimTail(block)
+        elseif last.kind == "if" then
+            trimTail(last.yes); trimTail(last.no)
+            if #last.yes.body == 0 then
+                if #last.no.body > 0 then
+                    last.cond, last.yes, last.no = negate(last.cond), last.no, last.yes
+                elseif not effect(last.cond, ctx.options) then
+                    block.body[#block.body] = nil
+                end
+            end
+        elseif last.kind == "do" then trimTail(last.body)
+        end
+    end
+    trimTail(ctx.ast)
 end
 -- Names are evidence, not descriptions of the value stored in a register.
 -- Associate debug-local intervals with reaching definitions before optimization;
@@ -1502,7 +1533,7 @@ local function anonymousName(state)
 end
 local function allocateNames(ctx, upnames)
     ctx.upnames = upnames or {}
-    local used, active, evidence, ordered = {}, {}, {}, {}
+    local used, active, evidence, ordered, functionNames = {}, {}, {}, {}, {}
     for name in pairs(ctx.options._state.globals) do used[name] = true end
     for _, name in ipairs(ctx.upnames) do used[name] = true end
     local function activate(v) if v then active[root(v)] = true end end
@@ -1510,6 +1541,11 @@ local function allocateNames(ctx, upnames)
     astwalk(ctx.ast, function(s)
         visitstatement(s, function(e) if e.tag == "ref" then activate(e.value) end end, ctx.options)
         for _, v in ipairs(s.outs or {}) do activate(v) end
+        if s.kind == "assign" and #s.outs == 1 and s.expr.tag == "closure" then
+            local v = root(s.outs[1])
+            local name = ctx.chunk.protos[s.expr.child + 1].debugname
+            if #v.defs == 1 and identifier(name) then functionNames[v] = name end
+        end
         activate(s.binding); for _, v in ipairs(s.bindings or {}) do activate(v) end
     end, ctx.options)
     for _, v in ipairs(ctx.values) do
@@ -1522,6 +1558,9 @@ local function allocateNames(ctx, upnames)
     for _, r in ipairs(ordered) do
         local recovered, count = nil, 0
         for name in pairs(evidence[r]) do recovered, count = name, count + 1 end
+        -- A prototype's debug name is direct function-name evidence, even
+        -- when the compiler stripped the separate local-variable records.
+        if count == 0 and functionNames[r] then recovered, count = functionNames[r], 1 end
         -- Preserve exact spelling/case only when unambiguous and scope-safe.
         -- Conflicting, invalid or unavailable names get local_X, never suffixes
         -- such as player2, lowercased names or semantic guesses.
@@ -1810,6 +1849,7 @@ function D.decompile(data, options)
     -- A local in a parent function must not capture an actual global referenced
     -- only in a nested function. Reserve real names across the entire chunk.
     for _, p in ipairs(chunk.protos) do
+        if identifier(p.debugname) then state.reserved[p.debugname] = true end
         for _, i in ipairs(p.instructions) do
             if i.op == "GETGLOBAL" or i.op == "SETGLOBAL" then
                 local k = p.constants[i.aux]

@@ -24,7 +24,7 @@ SOFTWARE.
 
 -- Luau bytecode decompiler. Runtime syntax: Lua 5.1; output syntax: Luau.
 -- MIT License. No native modules, bit library, string.unpack or input execution.
-local D = { version = "0.1.8" }
+local D = { version = "0.1.9" }
 local floor, concat, insert = math.floor, table.concat, table.insert
 local function fail(message)
     -- Bytecode error chunks and file names are untrusted diagnostic text.
@@ -692,7 +692,7 @@ local function ir(chunk, p, options)
                 elseif op == "NEWCLASSMEMBER" then
                     local k = p.constants[i.aux]; check(k and k.tag == 3, "invalid class member name")
                     stmt({ kind = "store", lhs = { tag = "index", base = read(a), key = literal(quote(k.value, options)), field = k.value }, expr = read(c) }, i)
-                elseif op == "SETLIST" then stmt({ kind = "setlist", target = read(a), first = i.aux, args = c == 0 and openargs(bb) or args(bb, c - 1) }, i)
+                elseif op == "SETLIST" then stmt({ kind = "setlist", open = c == 0, target = read(a), first = i.aux, args = c == 0 and openargs(bb) or args(bb, c - 1) }, i)
                 elseif binops[op] then assign(a, binary(binops[op], read(bb), read(c)), i)
                 elseif binops[op:sub(1, -2)] and op:sub(-1) == "K" then assign(a, binary(binops[op:sub(1, -2)], read(bb), constant(c)), i)
                 elseif op == "SUBRK" or op == "DIVRK" then assign(a, binary(op == "SUBRK" and "-" or "/", constant(bb), read(c)), i)
@@ -1063,6 +1063,87 @@ local function statementorder(s, visit, options)
     evalorder(s.cond, visit, nil, options); evalorder(s.initial, visit, nil, options); evalorder(s.limit, visit, nil, options); evalorder(s.step, visit, nil, options)
     for _, e in ipairs(s.generator or {}) do evalorder(e, visit, nil, options) end
 end
+-- Fold only adjacent writes to a fresh, unescaped table. Keeping this in
+-- the IR lets the usual single-use pass inline the completed constructor.
+local function foldTableLists(ctx, block)
+    local changed, builder, target, nextIndex, fields, open = false
+    local constructors = {}
+    for _, s in ipairs(block.stmts) do
+        if not s.removed then
+            local merged = false
+            if builder and not s.synthetic and not open then
+                local function selfRead(e)
+                    local found = false
+                    walk(e, function(x) if x.tag == "ref" and root(x.value) == target then found = true end end, ctx.options)
+                    return found
+                end
+                if s.kind == "setlist" and s.target.tag == "ref" and root(s.target.value) == target and s.first == nextIndex then
+                    local safe = true
+                    for _, e in ipairs(s.args) do if selfRead(e) then safe = false; break end end
+                    if safe then
+                        for _, e in ipairs(s.args) do
+                            builder.expr.entries[#builder.expr.entries + 1] = { value = e }
+                        end
+                        nextIndex = nextIndex + #s.args
+                        open, merged = s.open, true
+                    end
+                elseif s.kind == "store" and s.lhs.tag == "index" and s.lhs.base.tag == "ref" and root(s.lhs.base.value) == target then
+                    local key = s.lhs.key
+                    -- Numeric keys can overlap deferred SETLIST writes in a
+                    -- constructor; leave those writes in their original order.
+                    if key.tag == "literal" and key.string and not selfRead(s.expr) then
+                        local previous = fields[key.string]
+                        if not previous or not effect(previous.value, ctx.options) then
+                            -- Remove overwritten pure entries in one final pass,
+                            -- keeping new values in their evaluation order.
+                            if previous then previous.superseded = true end
+                            local entry = { key = key, value = s.expr }
+                            builder.expr.entries[#builder.expr.entries + 1] = entry
+                            fields[key.string], merged = entry, true
+                        end
+                    end
+                end
+            end
+            if merged then
+                s.removed, s.movedTo, changed = true, builder, true
+            else
+                builder = nil
+                if not s.synthetic and s.kind == "assign" and #s.outs == 1 and s.expr.tag == "table" then
+                    local v = root(s.outs[1])
+                    if #v.defs == 1 and not v.captured and not v.hold then
+                        local entries, safe = {}, true
+                        nextIndex, fields, open = 1, {}, false
+                        for _, original in ipairs(s.expr.entries) do
+                            local entry = { key = original.key, value = original.value }
+                            entries[#entries + 1] = entry
+                            if entry.key then
+                                if not entry.key.string then safe = false; break end
+                                fields[entry.key.string] = entry
+                            else
+                                nextIndex = nextIndex + 1
+                                local e = entry.value
+                                open = e.multret or ((e.tag == "call" or e.tag == "vararg") and not e.single)
+                            end
+                        end
+                        if safe then
+                            s.expr = { tag = "table", entries = entries }
+                            builder, target = s, v
+                            constructors[#constructors + 1] = s.expr
+                        end
+                    end
+                end
+            end
+        end
+    end
+    for _, constructor in ipairs(constructors) do
+        local entries = {}
+        for _, entry in ipairs(constructor.entries) do
+            if not entry.superseded then entries[#entries + 1] = entry end
+        end
+        constructor.entries = entries
+    end
+    return changed
+end
 local function optimizeIR(ctx)
     for pass = 1, 5 do
         groups(ctx); local changed = false
@@ -1077,8 +1158,28 @@ local function optimizeIR(ctx)
                             -- groups() indexes every use site. Revisit only statements
                             -- that can contain this value instead of rescanning the whole
                             -- CFG for every folded definition.
+                            local rewritten = {}
                             for _, site in ipairs(v.sites) do
-                                if not site.removed then visitstatement(site, replace, ctx.options) end
+                                -- A call may already have moved into a return or
+                                -- constructor during this reverse-order pass.
+                                while site and site.removed and site.movedTo do site = site.movedTo end
+                                if site and not site.removed and not rewritten[site] then
+                                    visitstatement(site, function(x)
+                                        local replacement = replace(x)
+                                        if replacement and e.tag == "ref" then
+                                            -- Alias elimination introduces uses at
+                                            -- the destination, not the removed MOVE.
+                                            local source = root(e.value)
+                                            source.uses = source.uses + 1
+                                            if not source.siteSeen[site] then
+                                                source.siteSeen[site] = true
+                                                source.sites[#source.sites + 1] = site
+                                            end
+                                        end
+                                        return replacement
+                                    end, ctx.options)
+                                    rewritten[site] = true
+                                end
                             end
                             s.removed, changed = true, true
                         elseif v.uses == 1 then
@@ -1112,6 +1213,9 @@ local function optimizeIR(ctx)
                     end
                 end
             end
+        end
+        for _, b in ipairs(ctx.graph.blocks) do
+            if foldTableLists(ctx, b) then changed = true end
         end
         if not changed then break end
     end
@@ -1523,10 +1627,17 @@ expression = function(e, ctx, level, parent, tail, depth)
     elseif e.tag == "table" then
         local parts = {}
         for j, pair in ipairs(e.entries) do
-            local key = pair.key and ((pair.key.string and identifier(pair.key.string)) and (pair.key.string .. " = ") or ("[" .. render(pair.key) .. "] = ")) or ""
-            parts[j] = key .. render(pair.value, 0, pair.key == nil and j == #e.entries)
+            local key = pair.key and ((pair.key.string and identifier(pair.key.string)) and (pair.key.string .. " = ") or ("[" .. expression(pair.key, ctx, level + 1, 0, false, depth) .. "] = ")) or ""
+            parts[j] = key .. expression(pair.value, ctx, level + 1, 0, pair.key == nil and j == #e.entries, depth)
         end
-        text = #parts == 0 and "{}" or ("{ " .. concat(parts, ", ") .. " }")
+        local content = concat(parts, ", ")
+        if #parts > 4 or #content > 100 or content:find("\n", 1, true) then
+            local ind = string.rep(ctx.indent, level)
+            for j, part in ipairs(parts) do parts[j] = ind .. ctx.indent .. part .. "," end
+            text = "{\n" .. concat(parts, "\n") .. "\n" .. ind .. "}"
+        else
+            text = #parts == 0 and "{}" or ("{ " .. content .. " }")
+        end
     elseif e.tag == "closure" then
         local names = {}
         for j, cap in ipairs(e.captures) do names[j] = render(cap.expr); check(identifier(names[j]), "capture is not a lexical binding") end

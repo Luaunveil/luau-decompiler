@@ -24,7 +24,7 @@ SOFTWARE.
 
 -- Luau bytecode decompiler. Runtime syntax: Lua 5.1; output syntax: Luau.
 -- MIT License. No native modules, bit library, string.unpack or input execution.
-local D = { version = "0.1.6" }
+local D = { version = "0.1.7" }
 local floor, concat, insert = math.floor, table.concat, table.insert
 local function fail(message)
     -- Bytecode error chunks and file names are untrusted diagnostic text.
@@ -776,7 +776,7 @@ local function visitstatement(s, visit, options)
     for i, e in ipairs(s.generator or {}) do s.generator[i] = walk(e, visit, options) end
 end
 local function groups(ctx)
-    for _, v in ipairs(ctx.values) do local r = root(v); r.defs, r.uses, r.sites = {}, 0, {} end
+    for _, v in ipairs(ctx.values) do local r = root(v); r.defs, r.uses, r.sites, r.siteSeen = {}, 0, {}, {} end
     for _, v in ipairs(ctx.values) do
         local r = root(v)
         if v.kind == "param" or (v.kind == "def" and v.stmt and not v.stmt.removed) then r.defs[#r.defs + 1] = v end
@@ -786,7 +786,7 @@ local function groups(ctx)
         if b.reachable then
             local function count(s)
                 visitstatement(s, function(e)
-                    if e.tag == "ref" then local v = root(e.value); v.uses = v.uses + 1; v.sites[#v.sites + 1] = s end
+                    if e.tag == "ref" then local v = root(e.value); v.uses = v.uses + 1; if not v.siteSeen[s] then v.siteSeen[s] = true; v.sites[#v.sites + 1] = s end end
                 end, ctx.options)
             end
             for _, s in ipairs(b.stmts) do if not s.removed and s.kind ~= "close" and not s.synthetic then count(s) end end
@@ -1045,10 +1045,11 @@ local function optimizeIR(ctx)
                     if #v.defs == 1 and not v.hold and not v.captured and not v.parameter then
                         if (e.tag == "literal" or (e.tag == "ref" and stable(e))) and not s.open then
                             local function replace(x) if x.tag == "ref" and root(x.value) == v then return e end end
-                            for _, block in ipairs(ctx.graph.blocks) do
-                                spend(ctx.options, #block.stmts + 1)
-                                for _, st in ipairs(block.stmts) do if not st.removed then visitstatement(st, replace, ctx.options) end end
-                                if block.term then visitstatement(block.term, replace, ctx.options) end
+                            -- groups() indexes every use site. Revisit only statements
+                            -- that can contain this value instead of rescanning the whole
+                            -- CFG for every folded definition.
+                            for _, site in ipairs(v.sites) do
+                                if not site.removed then visitstatement(site, replace, ctx.options) end
                             end
                             s.removed, changed = true, true
                         elseif v.uses == 1 then
@@ -1396,16 +1397,29 @@ local function planLocals(ctx)
             end
         end
         inspect(ctx.ast, #ctx.params)
+        -- A tiny overflowing child often inherits almost the whole parent
+        -- scope. Splitting that child cannot lower the active local count;
+        -- split its nearest substantial ancestor instead.
+        if candidate and (#candidate.body <= 2 or #candidate.declarations <= 4) then
+            local ancestor = candidate.parent
+            while ancestor and (#ancestor.body <= 2 or #ancestor.declarations <= 4) do ancestor = ancestor.parent end
+            if ancestor then candidate = ancestor end
+        end
         if not candidate then break end
         check(iteration <= #ctx.values, "cannot safely reduce lexical local count")
-        local middle = floor(#candidate.body / 2); local left, right = {}, {}
-        for i, st in ipairs(candidate.body) do
-            local side = i <= middle and left or right; side[#side + 1] = st
+        -- Split all oversized sequential regions in one pass. The previous
+        -- binary split rebuilt the complete scope graph once per pair of
+        -- statements, which became quadratic on generated mega-functions.
+        local limit = ctx.options.max_scope_locals or 180
+        local parts = math.max(2, math.ceil(#candidate.declarations / math.max(1, math.floor(limit / 2))))
+        local chunk = math.max(1, math.ceil(#candidate.body / parts))
+        local regions = {}
+        for first = 1, #candidate.body, chunk do
+            local body = {}
+            for i = first, math.min(#candidate.body, first + chunk - 1) do body[#body + 1] = candidate.body[i] end
+            regions[#regions + 1] = { kind = "do", body = { kind = "block", body = body } }
         end
-        candidate.body = {
-            { kind = "do", body = { kind = "block", body = left } },
-            { kind = "do", body = { kind = "block", body = right } }
-        }
+        candidate.body = regions
     end
     local function place(block)
         table.sort(block.declarations, function(a, b) return a.id < b.id end)

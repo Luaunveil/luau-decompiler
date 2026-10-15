@@ -3,7 +3,7 @@
 <p align="center">Luau Bytecode → 结构化 Luau 源码</p>
 
 <p align="center">
-  <a href="decompiler.lua"><img src="https://img.shields.io/badge/Version-0.1.6-94a3b8?style=flat-square&amp;labelColor=161b22" alt="Version 0.1.6"></a>
+  <a href="decompiler.lua"><img src="https://img.shields.io/badge/Version-0.1.7-94a3b8?style=flat-square&amp;labelColor=161b22" alt="Version 0.1.7"></a>
   <a href="https://www.lua.org/manual/5.1/"><img src="https://img.shields.io/badge/Lua-5.1-818cf8?style=flat-square&amp;logo=lua&amp;logoColor=white&amp;labelColor=161b22" alt="Written in Lua 5.1"></a>
   <a href="https://luau.org/"><img src="https://img.shields.io/badge/Output-Luau-38bdf8?style=flat-square&amp;labelColor=161b22" alt="Output Luau"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-34d399?style=flat-square&amp;labelColor=161b22" alt="License MIT"></a>
@@ -19,6 +19,8 @@
 ---
 
 **Lua 5.1 / Luau · 各自单文件 · 无第三方依赖。** 还原控制流、闭包、上值与多返回值，不执行输入字节码；支持 Luau 类形状常量，并在非类运行时中降级为可执行表结构。
+
+0.1.7 针对超大函数优化了 IR 定义替换和局部变量规划：按实际引用位置更新表达式，并将超大顺序区域按批次切分，同时在继承父作用域过多局部变量时回退到合适的祖先作用域。这样不会跳过控制流恢复，且避免大函数在局部规划阶段出现二次复杂度。
 
 <a id="quick-start"></a>
 

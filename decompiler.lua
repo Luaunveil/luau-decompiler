@@ -24,7 +24,7 @@ SOFTWARE.
 
 -- Luau bytecode decompiler. Runtime syntax: Lua 5.1; output syntax: Luau.
 -- MIT License. No native modules, bit library, string.unpack or input execution.
-local D = { version = "0.1.7" }
+local D = { version = "0.1.8" }
 local floor, concat, insert = math.floor, table.concat, table.insert
 local function fail(message)
     -- Bytecode error chunks and file names are untrusted diagnostic text.
@@ -111,13 +111,42 @@ end
 local function quote(s, options)
     local cached = options and options._quoted[s]
     if cached then return cached end
-    -- Native scanning/escaping avoids a second Lua-level per-byte pass and
-    -- memoization avoids re-escaping a large constant at every reference.
-    local escaped = s:gsub('[%z\1-\31\127-\255\\"]', function(c)
+    -- Keep readable UTF-8 without interpreting literal backslash sequences.
+    -- ASCII scanning stays native; only non-ASCII runs need validation below.
+    local escaped = s:gsub('[%z\1-\31\127\\"]', function(c)
         local n = c:byte()
         if n == 10 then return "\\n" elseif n == 13 then return "\\r" elseif n == 9 then return "\\t"
         elseif c == '"' then return '\\"' elseif c == '\\' then return '\\\\' end
         return string.format("\\%03d", n)
+    end)
+    escaped = escaped:gsub('[\128-\255]+', function(run)
+        local parts, first, i, size = {}, 1, 1, #run
+        while i <= size do
+            local a, b, c, d = run:byte(i, i + 3)
+            local length = 0
+            if a >= 194 and a <= 223 and b and b >= 128 and b <= 191 then
+                length = 2
+            elseif a >= 224 and a <= 239 and b and c and c >= 128 and c <= 191 then
+                -- Reject overlong sequences and UTF-16 surrogate code points.
+                local lower = a == 224 and 160 or 128
+                local upper = a == 237 and 159 or 191
+                if b >= lower and b <= upper then length = 3 end
+            elseif a >= 240 and a <= 244 and b and c and d and c >= 128 and c <= 191 and d >= 128 and d <= 191 then
+                local lower = a == 240 and 144 or 128
+                local upper = a == 244 and 143 or 191
+                if b >= lower and b <= upper then length = 4 end
+            end
+            if length > 0 then
+                i = i + length
+            else
+                if first < i then parts[#parts + 1] = run:sub(first, i - 1) end
+                parts[#parts + 1] = string.format("\\%03d", a)
+                i = i + 1; first = i
+            end
+        end
+        if first == 1 then return run end
+        if first <= size then parts[#parts + 1] = run:sub(first) end
+        return concat(parts)
     end)
     if options then
         check(#escaped + 2 <= options.max_output_bytes, "string literal exceeds output limit")

@@ -24,7 +24,7 @@ SOFTWARE.
 
 -- Luau bytecode decompiler. Runtime syntax: Lua 5.1; output syntax: Luau.
 -- MIT License. No native modules, bit library, string.unpack or input execution.
-local D = { version = "0.1.11" }
+local D = { version = "0.1.12" }
 local floor, concat, insert = math.floor, table.concat, table.insert
 local function fail(message)
     -- Bytecode error chunks and file names are untrusted diagnostic text.
@@ -1110,7 +1110,12 @@ local function foldTableLists(ctx, block)
                 builder = nil
                 if not s.synthetic and s.kind == "assign" and #s.outs == 1 and s.expr.tag == "table" then
                     local v = root(s.outs[1])
-                    if #v.defs == 1 and not v.captured and not v.hold then
+                    -- A value capture pins the binding, not the constructor.
+                    -- Adjacent initialization may still be folded: no intervening
+                    -- statement has exposed the table, and self-reads are rejected.
+                    -- Reference captures retain the guard because an earlier
+                    -- closure could observe the binding while values are evaluated.
+                    if #v.defs == 1 and not v.captured then
                         local entries, safe = {}, true
                         nextIndex, fields, open = 1, {}, false
                         for _, original in ipairs(s.expr.entries) do
@@ -1153,7 +1158,7 @@ local function foldNestedTables(ctx, block)
         if not s.removed then
             if not s.synthetic and s.kind == "assign" and #s.outs == 1 and s.expr.tag == "table" then
                 local v = root(s.outs[1])
-                if #v.defs == 1 and not v.captured and not v.hold and not v.parameter then
+                if #v.defs == 1 and not v.captured and not v.parameter then
                     if #s.expr.entries == 0 and following and following.kind == "setlist" and following.first == 1 and following.target.tag == "ref" and root(following.target.value) == v then
                         local selfRead = false
                         for _, e in ipairs(following.args) do
@@ -1168,7 +1173,8 @@ local function foldNestedTables(ctx, block)
                             following = nextLive[following]
                         end
                     end
-                    if v.uses == 1 and following and not following.synthetic then
+                    -- Keep the binding itself when a closure captures its value.
+                    if not v.hold and v.uses == 1 and following and not following.synthetic then
                         local safe, found, before = true, false, false
                         statementorder(following, function(x, conditionalDepth, kind)
                             if x.tag == "ref" and root(x.value) == v then
@@ -1745,7 +1751,12 @@ renderBlock = function(block, ctx, level)
         bytes = bytes + #s; check(bytes <= ctx.options.max_output_bytes, "output exceeds size limit")
         out[#out + 1] = s
     end
-    local function line(s) spend(ctx.options); append(join(ctx.options, { ind, s, "\n" })) end
+    local function line(s)
+        -- A parenthesized call/index can otherwise continue the previous
+        -- statement across a newline (for example, a SETLIST helper call).
+        if s:sub(1, 1) == "(" then s = ";" .. s end
+        spend(ctx.options); append(join(ctx.options, { ind, s, "\n" }))
+    end
     local function concat(parts, sep) return join(ctx.options, parts, sep) end
     local function expr(e, tail) return expression(e, ctx, level, 0, tail) end
     local function names(values) local a = {}; for j, v in ipairs(values) do a[j] = root(v).name end; return concat(a, ", ") end

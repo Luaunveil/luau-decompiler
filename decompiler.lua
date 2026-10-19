@@ -24,7 +24,7 @@ SOFTWARE.
 
 -- Luau bytecode decompiler. Runtime syntax: Lua 5.1; output syntax: Luau.
 -- MIT License. No native modules, bit library, string.unpack or input execution.
-local D = { version = "0.1.12" }
+local D = { version = "0.1.13" }
 local floor, concat, insert = math.floor, table.concat, table.insert
 local function fail(message)
     -- Bytecode error chunks and file names are untrusted diagnostic text.
@@ -1031,6 +1031,20 @@ local function stable(e)
     if e.tag == "ref" then local v = root(e.value); return #v.defs == 1 and not v.captured end
     return false
 end
+-- A fresh single-use table with stable contents can be allocated at its use
+-- site, even after a method lookup. Do not delay calls, property reads, or
+-- dynamic keys (which can fail for nil/NaN) inside its initializer.
+local function delayableTable(e, options, depth)
+    depth = (depth or 0) + 1
+    check(depth <= options.max_expression_depth, "expression nesting limit exceeded"); spend(options)
+    if stable(e) then return true end
+    if e.tag ~= "table" then return false end
+    for _, entry in ipairs(e.entries) do
+        if entry.key and (entry.key.tag ~= "literal" or not entry.key.string) then return false end
+        if not delayableTable(entry.value, options, depth) then return false end
+    end
+    return true
+end
 local function effect(e, options, depth)
     depth = (depth or 0) + 1; check(depth <= options.max_expression_depth, "expression nesting limit exceeded"); spend(options)
     if not e then return false end
@@ -1250,8 +1264,8 @@ local function optimizeIR(ctx)
                                 -- when their value captures cannot change. Reference
                                 -- captures keep the same binding, but may not cross
                                 -- CLOSEUPVALS.
-                                local delayable = e.tag == "closure"
-                                if delayable then
+                                local delayable = e.tag == "table" and delayableTable(e, ctx.options) or e.tag == "closure"
+                                if e.tag == "closure" then
                                     for _, cap in ipairs(e.captures) do
                                         if cap.kind == 0 and not stable(cap.expr) then delayable = false; break end
                                     end
@@ -1366,10 +1380,30 @@ end
 local function assignone(block)
     if #block.body == 1 and block.body[1].kind == "assign" and #block.body[1].outs == 1 then return block.body[1] end
 end
-local function boolselect(cond, yes, no)
+local function isBoolean(e, options, depth)
+    depth = (depth or 0) + 1
+    check(depth <= options.max_expression_depth, "expression nesting limit exceeded"); spend(options)
+    if (e.tag == "unary" and e.op == "not") or
+        (e.tag == "literal" and (e.text == "true" or e.text == "false")) or
+        (e.tag == "binary" and (e.op == "==" or e.op == "~=" or e.op == "<" or e.op == ">" or e.op == "<=" or e.op == ">=")) then
+        return true
+    end
+    if e.tag == "binary" and (e.op == "and" or e.op == "or") then
+        return isBoolean(e.a, options, depth) and isBoolean(e.b, options, depth)
+    end
+    if e.tag == "ifexpr" then return isBoolean(e.yes, options, depth) and isBoolean(e.no, options, depth) end
+    return false
+end
+local function booleanValue(e, options)
+    if isBoolean(e, options) then return e end
+    return unary("not", unary("not", e))
+end
+local function boolselect(cond, yes, no, options)
     if yes.tag == "literal" and no.tag == "literal" then
-        if yes.text == "true" and no.text == "false" then return unary("not", unary("not", cond)) end
-        if yes.text == "false" and no.text == "true" then return negate(cond) end
+        if yes.text == "true" and no.text == "false" then return booleanValue(cond, options) end
+        -- negate() simplifies truth tests; its result need not be a boolean
+        -- (not(not x) becomes x). Branch-selected booleans must stay booleans.
+        if yes.text == "false" and no.text == "true" then return booleanValue(negate(cond), options) end
     end
     return { tag = "ifexpr", cond = cond, yes = yes, no = no }
 end
@@ -1388,14 +1422,14 @@ local function optimizeAST(ctx)
                 end
                 local yes, no = assignone(s.yes), assignone(s.no)
                 if ctx.options.expression_if ~= false and yes and no and root(yes.outs[1]) == root(no.outs[1]) then
-                    s = { kind = "assign", outs = yes.outs, expr = boolselect(s.cond, yes.expr, no.expr), pc = s.pc }
+                    s = { kind = "assign", outs = yes.outs, expr = boolselect(s.cond, yes.expr, no.expr, ctx.options), pc = s.pc }
                 elseif ctx.options.expression_if ~= false and yes and #s.no.body == 0 then
                     local prev = out[#out]
                     if prev and prev.kind == "assign" and #prev.outs == 1 and root(prev.outs[1]) == root(yes.outs[1]) and prev.expr.tag == "literal" and not root(prev.outs[1]).captured and not root(prev.outs[1]).hold then
                         local used = false
                         local function readsPrevious(e) if e.tag == "ref" and root(e.value) == root(prev.outs[1]) then used = true end end
                         walk(s.cond, readsPrevious, ctx.options); walk(yes.expr, readsPrevious, ctx.options)
-                        if not used then out[#out] = nil; s = { kind = "assign", outs = yes.outs, expr = boolselect(s.cond, yes.expr, prev.expr), pc = s.pc } end
+                        if not used then out[#out] = nil; s = { kind = "assign", outs = yes.outs, expr = boolselect(s.cond, yes.expr, prev.expr, ctx.options), pc = s.pc } end
                     end
                 end
             elseif s.kind == "fornum" then

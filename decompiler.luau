@@ -24,7 +24,7 @@ SOFTWARE.
 
 -- Luau bytecode decompiler. Runtime syntax: Lua 5.1; output syntax: Luau.
 -- MIT License. No native modules, bit library, string.unpack or input execution.
-local D = { version = "0.1.13" }
+local D = { version = "0.1.14" }
 local floor, concat, insert = math.floor, table.concat, table.insert
 local function fail(message)
     -- Bytecode error chunks and file names are untrusted diagnostic text.
@@ -1031,6 +1031,15 @@ local function stable(e)
     if e.tag == "ref" then local v = root(e.value); return #v.defs == 1 and not v.captured end
     return false
 end
+-- Keep string and numeric keys distinct; reject keys whose evaluation or
+-- insertion can fail. Lua table indexing also canonicalizes numeric spellings.
+local function literalTableKey(e)
+    if not e or e.tag ~= "literal" then return nil end
+    if e.string ~= nil then return e.string end
+    if e.text == "true" then return true elseif e.text == "false" then return false end
+    local n = tonumber(e.text)
+    if n and n == n and n ~= math.huge and n ~= -math.huge then return n end
+end
 -- A fresh single-use table with stable contents can be allocated at its use
 -- site, even after a method lookup. Do not delay calls, property reads, or
 -- dynamic keys (which can fail for nil/NaN) inside its initializer.
@@ -1040,7 +1049,7 @@ local function delayableTable(e, options, depth)
     if stable(e) then return true end
     if e.tag ~= "table" then return false end
     for _, entry in ipairs(e.entries) do
-        if entry.key and (entry.key.tag ~= "literal" or not entry.key.string) then return false end
+        if entry.key and literalTableKey(entry.key) == nil then return false end
         if not delayableTable(entry.value, options, depth) then return false end
     end
     return true
@@ -1080,7 +1089,7 @@ end
 -- Fold only adjacent writes to a fresh, unescaped table. Keeping this in
 -- the IR lets the usual single-use pass inline the completed constructor.
 local function foldTableLists(ctx, block)
-    local changed, builder, target, nextIndex, fields, open = false
+    local changed, builder, target, nextIndex, fields, open, largestIndex = false
     local constructors = {}
     for _, s in ipairs(block.stmts) do
         if not s.removed then
@@ -1092,7 +1101,9 @@ local function foldTableLists(ctx, block)
                     return found
                 end
                 if s.kind == "setlist" and s.target.tag == "ref" and root(s.target.value) == target and s.first == nextIndex then
-                    local safe = true
+                    -- List stores may be deferred by the source compiler. Do
+                    -- not combine them with overlapping explicit numeric keys.
+                    local safe = largestIndex < nextIndex
                     for _, e in ipairs(s.args) do if selfRead(e) then safe = false; break end end
                     if safe then
                         for _, e in ipairs(s.args) do
@@ -1103,17 +1114,18 @@ local function foldTableLists(ctx, block)
                     end
                 elseif s.kind == "store" and s.lhs.tag == "index" and s.lhs.base.tag == "ref" and root(s.lhs.base.value) == target then
                     local key = s.lhs.key
-                    -- Numeric keys can overlap deferred SETLIST writes in a
-                    -- constructor; leave those writes in their original order.
-                    if key.tag == "literal" and key.string and not selfRead(s.expr) then
-                        local previous = fields[key.string]
+                    local identity = literalTableKey(key)
+                    local arrayIndex = type(identity) == "number" and identity >= 1 and identity == floor(identity)
+                    if identity ~= nil and not (arrayIndex and identity < nextIndex) and not selfRead(s.expr) then
+                        local previous = fields[identity]
                         if not previous or not effect(previous.value, ctx.options) then
                             -- Remove overwritten pure entries in one final pass,
                             -- keeping new values in their evaluation order.
                             if previous then previous.superseded = true end
                             local entry = { key = key, value = s.expr }
                             builder.expr.entries[#builder.expr.entries + 1] = entry
-                            fields[key.string], merged = entry, true
+                            fields[identity], merged = entry, true
+                            if arrayIndex then largestIndex = math.max(largestIndex, identity) end
                         end
                     end
                 end
@@ -1131,13 +1143,17 @@ local function foldTableLists(ctx, block)
                     -- closure could observe the binding while values are evaluated.
                     if #v.defs == 1 and not v.captured then
                         local entries, safe = {}, true
-                        nextIndex, fields, open = 1, {}, false
+                        nextIndex, fields, open, largestIndex = 1, {}, false, 0
                         for _, original in ipairs(s.expr.entries) do
                             local entry = { key = original.key, value = original.value }
                             entries[#entries + 1] = entry
                             if entry.key then
-                                if not entry.key.string then safe = false; break end
-                                fields[entry.key.string] = entry
+                                local identity = literalTableKey(entry.key)
+                                if identity == nil then safe = false; break end
+                                fields[identity] = entry
+                                if type(identity) == "number" and identity >= 1 and identity == floor(identity) then
+                                    largestIndex = math.max(largestIndex, identity)
+                                end
                             else
                                 nextIndex = nextIndex + 1
                                 local e = entry.value
@@ -1470,20 +1486,30 @@ local function optimizeAST(ctx)
         while i <= #out do
             local s = out[i]
             if s.kind == "assign" and #s.outs == 1 and s.expr.tag == "table" then
-                local target = root(s.outs[1]); local entries = {}
-                for j, entry in ipairs(s.expr.entries) do entries[j] = entry end
+                local target = root(s.outs[1]); local entries, listCount, openList = {}, 0, false
+                for j, entry in ipairs(s.expr.entries) do
+                    entries[j] = entry
+                    if not entry.key then
+                        listCount = listCount + 1
+                        local e = entry.value
+                        openList = e.multret or ((e.tag == "call" or e.tag == "vararg") and not e.single)
+                    end
+                end
                 s.expr = { tag = "table", entries = entries }
                 while i < #out do
                     local next = out[i + 1]
                     local lhs = next.lhs
                     if next.kind ~= "store" or not lhs or lhs.tag ~= "index" or lhs.base.tag ~= "ref" or root(lhs.base.value) ~= target or lhs.key.tag ~= "literal" then break end
+                    local identity = literalTableKey(lhs.key)
+                    if identity == nil or openList then break end
+                    if type(identity) == "number" and identity >= 1 and identity == floor(identity) and identity <= listCount then break end
                     local selfRead = false
                     walk(next.expr, function(e) if e.tag == "ref" and root(e.value) == target then selfRead = true end end, ctx.options)
                     if selfRead or target.captured or target.hold then break end
                     local duplicate
                     spend(ctx.options, #entries)
                     for j, entry in ipairs(entries) do
-                        if entry.key and entry.key.tag == "literal" and entry.key.text == lhs.key.text then duplicate = j; break end
+                        if entry.key and literalTableKey(entry.key) == identity then duplicate = j; break end
                     end
                     if duplicate then
                         if effect(entries[duplicate].value, ctx.options) then break end
@@ -1752,10 +1778,24 @@ expression = function(e, ctx, level, parent, tail, depth)
         prec = 9; if tail and e.single then text, prec = "(" .. text .. ")", 10 end
     elseif e.tag == "vararg" then text = tail and e.single and "(...)" or "..."
     elseif e.tag == "table" then
-        local parts = {}
+        local parts, array, nextIndex = {}, true, 1
+        -- Only erase explicit indices when the entire numeric sequence is
+        -- 1..n. Sparse, repeated and mixed list/key writes retain their keys.
+        for _, pair in ipairs(e.entries) do
+            local key = literalTableKey(pair.key)
+            if not pair.key or key == nil then array = false; break end
+            if type(key) == "number" then
+                if key ~= nextIndex then array = false; break end
+                nextIndex = nextIndex + 1
+            end
+        end
         for j, pair in ipairs(e.entries) do
-            local key = pair.key and ((pair.key.string and identifier(pair.key.string)) and (pair.key.string .. " = ") or ("[" .. expression(pair.key, ctx, level + 1, 0, false, depth) .. "] = ")) or ""
-            parts[j] = key .. expression(pair.value, ctx, level + 1, 0, pair.key == nil and j == #e.entries, depth)
+            local implicit = pair.key == nil or (array and type(literalTableKey(pair.key)) == "number")
+            local key = not implicit and ((pair.key.string and identifier(pair.key.string)) and (pair.key.string .. " = ") or ("[" .. expression(pair.key, ctx, level + 1, 0, false, depth) .. "] = ")) or ""
+            local value = expression(pair.value, ctx, level + 1, 0, pair.key == nil and j == #e.entries, depth)
+            -- An explicit keyed value always contributes exactly one result.
+            if pair.key and implicit and j == #e.entries and (pair.value.tag == "call" or pair.value.tag == "vararg") then value = "(" .. value .. ")" end
+            parts[j] = key .. value
         end
         local content = concat(parts, ", ")
         if #parts > 4 or #content > 100 or content:find("\n", 1, true) then

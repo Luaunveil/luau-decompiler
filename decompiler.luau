@@ -24,7 +24,7 @@ SOFTWARE.
 
 -- Luau bytecode decompiler. Runtime syntax: Lua 5.1; output syntax: Luau.
 -- MIT License. No native modules, bit library, string.unpack or input execution.
-local D = { version = "0.1.14" }
+local D = { version = "0.1.15" }
 local floor, concat, insert = math.floor, table.concat, table.insert
 local function fail(message)
     -- Bytecode error chunks and file names are untrusted diagnostic text.
@@ -391,7 +391,13 @@ local function validateInstruction(p, i)
     elseif op == "GETUPVAL" or op == "SETUPVAL" then reg(a); check(b < p.nups, "upvalue out of range")
     elseif op == "GETIMPORT" then
         reg(a); local k = constant(i.d, 4)
-        check(k.value == i.aux, "GETIMPORT path does not match its constant")
+        local count = floor(i.aux / 1073741824)
+        check(count >= 1 and count <= 3, "invalid GETIMPORT path length at pc " .. i.pc)
+        -- The VM reads only count 10-bit indices. Runtime bytecode may carry
+        -- nonzero data in the unused low bits; it is not part of the path.
+        local padding = 2 ^ ((3 - count) * 10)
+        check(floor(k.value / padding) == floor(i.aux / padding), "GETIMPORT path does not match its constant")
+        for j = 1, count do constant(floor(i.aux / 2 ^ ((3 - j) * 10)) % 1024, 3) end
     elseif op == "CLOSEUPVALS" then range(a, 0)
     elseif op == "CALL" or op == "CALLFB" then
         reg(a); if b > 0 then range(a, b) end; if c > 1 then range(a, c - 1) end
@@ -407,7 +413,9 @@ local function validateInstruction(p, i)
     elseif op == "FORGLOOP" then local n = i.aux % 256; check(n > 0, "empty FORGLOOP result range"); range(a, 3 + n)
     elseif op == "JUMPIF" or op == "JUMPIFNOT" then reg(a)
     elseif op == "JUMPXEQKNIL" or op == "JUMPXEQKB" then
-        reg(a); check(i.aux % 2147483648 <= (op == "JUMPXEQKB" and 1 or 0), "invalid comparison flags")
+        -- Only bit 31 (NOT) and, for booleans, bit 0 are meaningful.
+        -- The IR masks those bits; do not require unused AUX bits to be zero.
+        reg(a)
     elseif op == "JUMPXEQKN" or op == "JUMPXEQKS" then reg(a); constant(i.aux % 16777216, op == "JUMPXEQKN" and 2 or 3)
     elseif conditional[op] and op ~= "CMPPROTO" then reg(a); reg(i.aux)
     elseif op == "FASTCALL1" or op == "FASTCALL2" or op == "FASTCALL2K" or op == "FASTCALL3" then

@@ -3,7 +3,7 @@
 <p align="center">Luau Bytecode → 结构化 Luau 源码</p>
 
 <p align="center">
-  <a href="decompiler.lua"><img src="https://img.shields.io/badge/Version-0.1.14-94a3b8?style=flat-square&amp;labelColor=161b22" alt="Version 0.1.14"></a>
+  <a href="decompiler.lua"><img src="https://img.shields.io/badge/Version-0.1.15-94a3b8?style=flat-square&amp;labelColor=161b22" alt="Version 0.1.15"></a>
   <a href="https://www.lua.org/manual/5.1/"><img src="https://img.shields.io/badge/Lua-5.1-818cf8?style=flat-square&amp;logo=lua&amp;logoColor=white&amp;labelColor=161b22" alt="Written in Lua 5.1"></a>
   <a href="https://luau.org/"><img src="https://img.shields.io/badge/Output-Luau-38bdf8?style=flat-square&amp;labelColor=161b22" alt="Output Luau"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-34d399?style=flat-square&amp;labelColor=161b22" alt="License MIT"></a>
@@ -20,7 +20,9 @@
 
 **Lua 5.1 / Luau · 各自单文件 · 无第三方依赖。** 还原控制流、闭包、上值与多返回值，不执行输入字节码；支持 Luau 类形状常量，并在非类运行时中降级为可执行表结构。
 
-0.1.14 改进表初始化的还原：将安全的连续数字键赋值合并为数组字面量，支持闭包值捕获、嵌套表与函数参数，并保留字符串、数字和布尔键的区别。重叠索引和多返回值后续写入会保留必要的独立语句，避免改变覆盖顺序或丢失返回值。
+0.1.15 修复部分 Roblox 字节码因指令未使用位非零而被误拒绝的问题：`GETIMPORT` 按实际路径长度比较有效索引，nil／布尔比较按虚拟机定义读取标志位。实际路径不一致、无效常量和越界引用仍会被拒绝。
+
+表初始化支持将安全的连续数字键赋值合并为数组字面量，以及闭包值捕获、嵌套表与函数参数内联，并保留字符串、数字和布尔键的区别。重叠索引和多返回值后续写入会保留必要的独立语句，避免改变覆盖顺序或丢失返回值。
 
 <a id="quick-start"></a>
 
